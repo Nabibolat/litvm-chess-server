@@ -28,12 +28,19 @@ io.on("connection", (socket) => {
     console.log("Player connected:", socket.id);
 
     // ===== МАТЧМЕЙКИНГ =====
-    socket.on("findMatch", ({ userAddress, timeControl }) => {
+        socket.on("findMatch", ({ userAddress, timeControl }) => {
         console.log(`Find match: ${userAddress}, time: ${timeControl}`);
 
+        // ← НОВОЕ: убираем прошлые записи этого же адреса (защита от двух вкладок)
+        matchQueue = matchQueue.filter(
+            (p) => p.userAddress.toLowerCase() !== userAddress.toLowerCase()
+        );
+
         // Ищем соперника в очереди с тем же контролем времени
+        // Сравнение адресов регистронезависимое — MetaMask может вернуть разный регистр
         const opponentIndex = matchQueue.findIndex(
-            (p) => p.timeControl === timeControl && p.userAddress !== userAddress
+            (p) => p.timeControl === timeControl &&
+                   p.userAddress.toLowerCase() !== userAddress.toLowerCase()
         );
 
         if (opponentIndex === -1) {
@@ -72,12 +79,17 @@ io.on("connection", (socket) => {
                 timeControl: timeControl
             });
 
-            io.to(socket.id).emit("matchFound", {
+                        io.to(socket.id).emit("matchFound", {
                 roomId: roomId,
                 color: isFirstWhite ? "black" : "white",
                 opponentAddress: opponent.userAddress,
                 timeControl: timeControl
             });
+
+            // ← НОВОЕ: стартовый FEN обоим — клиент синхронизируется до первого хода
+            const startFen = activeGames.get(roomId).game.fen();
+            io.to(opponent.socketId).emit("gameState", { fen: startFen });
+            io.to(socket.id).emit("gameState", { fen: startFen });
 
             console.log(`Match created: ${roomId} (${white.userAddress} vs ${black.userAddress})`);
         }
@@ -105,7 +117,7 @@ io.on("connection", (socket) => {
             }
 
             // Рассылаем всем в комнате
-            io.to(roomId).emit("moveMade", {
+                        io.to(roomId).emit("moveMade", {
                 from: move.from,
                 to: move.to,
                 fen: room.game.fen(),
@@ -117,6 +129,12 @@ io.on("connection", (socket) => {
                     ? (room.game.turn() === "w" ? "black" : "white") 
                     : null
             });
+
+            // ← НОВОЕ: освобождаем комнату после матча
+            if (room.game.game_over()) {
+                activeGames.delete(roomId);
+                console.log(`Room ${roomId} closed — game over`);
+            }
         } catch (e) {
             socket.emit("moveError", { message: e.message });
         }
