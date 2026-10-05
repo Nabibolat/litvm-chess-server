@@ -124,6 +124,7 @@ io.on("connection", (socket) => {
                         io.to(roomId).emit("moveMade", {
                 from: move.from,
                 to: move.to,
+                san: move.san,
                 fen: room.game.fen(),
                 turn: room.game.turn(),
                 isGameOver: room.game.game_over(),
