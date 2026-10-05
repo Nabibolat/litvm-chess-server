@@ -28,7 +28,7 @@ io.on("connection", (socket) => {
     console.log("Player connected:", socket.id);
 
     // ===== МАТЧМЕЙКИНГ =====
-        socket.on("findMatch", ({ userAddress, timeControl }) => {
+        socket.on("findMatch", ({ userAddress, timeControl, lichessUsername, lichessElo }) => {
         console.log(`Find match: ${userAddress}, time: ${timeControl}`);
 
         // ← НОВОЕ: убираем прошлые записи этого же адреса (защита от двух вкладок)
@@ -45,7 +45,7 @@ io.on("connection", (socket) => {
 
         if (opponentIndex === -1) {
             // Соперника нет — ставим в очередь
-            matchQueue.push({ socketId: socket.id, userAddress, timeControl });
+            matchQueue.push({ socketId: socket.id, userAddress, timeControl, lichessUsername, lichessElo });
             socket.emit("waitingForOpponent");
             console.log(`Queued: ${userAddress}`);
         } else {
