@@ -72,17 +72,21 @@ io.on("connection", (socket) => {
             io.sockets.sockets.get(socket.id)?.join(roomId);
 
             // Сообщаем обоим
-            io.to(opponent.socketId).emit("matchFound", {
+                        io.to(opponent.socketId).emit("matchFound", {
                 roomId: roomId,
                 color: isFirstWhite ? "white" : "black",
                 opponentAddress: userAddress,
+                opponentLichess: lichessUsername || null,
+                opponentElo: lichessElo || null,
                 timeControl: timeControl
             });
 
-                        io.to(socket.id).emit("matchFound", {
+            io.to(socket.id).emit("matchFound", {
                 roomId: roomId,
                 color: isFirstWhite ? "black" : "white",
                 opponentAddress: opponent.userAddress,
+                opponentLichess: opponent.lichessUsername || null,
+                opponentElo: opponent.lichessElo || null,
                 timeControl: timeControl
             });
 
