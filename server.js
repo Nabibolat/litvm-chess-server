@@ -59,12 +59,20 @@ io.on("connection", (socket) => {
             const black = isFirstWhite ? { socketId: socket.id, userAddress } : opponent;
 
             // Создаём игру
+                        const initialTimeMs = timeControl * 1000;
             activeGames.set(roomId, {
                 game: new Chess(),
                 white: white.userAddress,
                 black: black.userAddress,
                 whiteSocket: white.socketId,
-                blackSocket: black.socketId
+                blackSocket: black.socketId,
+                timeControl: timeControl,
+                clocks: {
+                    white: initialTimeMs,
+                    black: initialTimeMs,
+                    lastMoveTimestamp: Date.now()
+                },
+                moveHistory: []
             });
 
             // Подключаем обоих в комнату
