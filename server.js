@@ -122,19 +122,56 @@ io.on("connection", (socket) => {
         }
 
         try {
+            const now = Date.now();
+            const timeSpent = now - room.clocks.lastMoveTimestamp;
+            const currentTurn = room.game.turn();            // 'w' или 'b'
+            const playerColor = currentTurn === 'w' ? 'white' : 'black';
+
+            // 1. Проверяем таймаут: если игрок просрочил — победа соперника
+            if (room.clocks[playerColor] - timeSpent <= 0) {
+                const winner = playerColor === 'white' ? 'black' : 'white';
+                io.to(roomId).emit("moveMade", {
+                    from: null, to: null, san: null,
+                    fen: room.game.fen(),
+                    turn: room.game.turn(),
+                    isGameOver: true,
+                    isCheckmate: false,
+                    isDraw: false,
+                    winner: winner,
+                    reason: "timeout"
+                });
+                activeGames.delete(roomId);
+                console.log(`Room ${roomId} closed — ${winner} wins on time`);
+                return;
+            }
+
+            // 2. Валидация хода через chess.js
             const move = room.game.move({ from, to, promotion: promotion || "q" });
             if (!move) {
                 socket.emit("moveError", { message: "Illegal move" });
                 return;
             }
 
-            // Рассылаем всем в комнате
-                        io.to(roomId).emit("moveMade", {
+            // 3. Списываем время с часов игрока
+            room.clocks[playerColor] -= timeSpent;
+            room.clocks.lastMoveTimestamp = now;
+
+            // 4. Логируем для античита
+            room.moveHistory.push({
+                san: move.san,
+                timeSpentMs: timeSpent,
+                timestamp: now,
+                turn: currentTurn
+            });
+
+            // 5. Рассылаем ход + актуальные часы
+            io.to(roomId).emit("moveMade", {
                 from: move.from,
                 to: move.to,
                 san: move.san,
                 fen: room.game.fen(),
                 turn: room.game.turn(),
+                clocks: room.clocks,
                 isGameOver: room.game.game_over(),
                 isCheckmate: room.game.in_checkmate(),
                 isDraw: room.game.in_draw(),
@@ -143,7 +180,7 @@ io.on("connection", (socket) => {
                     : null
             });
 
-            // ← НОВОЕ: освобождаем комнату после матча
+            // 6. Освобождаем комнату после матча
             if (room.game.game_over()) {
                 activeGames.delete(roomId);
                 console.log(`Room ${roomId} closed — game over`);
