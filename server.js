@@ -100,13 +100,24 @@ async function analyzeForFairPlay(room) {
         const whiteFlagged = acpl.white.length >= 8 && (whiteACPL < 10 || (whiteACPL < 20 && timingSuspicious));
         const blackFlagged = acpl.black.length >= 8 && (blackACPL < 10 || (blackACPL < 20 && timingSuspicious));
 
-        if (whiteFlagged || blackFlagged) {
+                if (whiteFlagged || blackFlagged) {
             console.warn(`[Anti-Cheat] ⚠️ SUSPICIOUS GAME DETECTED: room ${roomId}`, {
                 white: { acpl: whiteACPL.toFixed(1), flagged: whiteFlagged },
                 black: { acpl: blackACPL.toFixed(1), flagged: blackFlagged },
                 avgTimeMs: avgTime.toFixed(0),
                 stdDevMs: stdDev.toFixed(0)
             });
+
+            // Telegram alert
+            const alertText =
+`⚠️ <b>SUSPICIOUS GAME</b>
+
+<b>Room:</b> ${roomId}
+<b>White:</b> ACPL ${whiteACPL.toFixed(1)} ${whiteFlagged ? "🚩" : ""}
+<b>Black:</b> ACPL ${blackACPL.toFixed(1)} ${blackFlagged ? "🚩" : ""}
+<b>Avg time:</b> ${avgTime.toFixed(0)} ms
+<b>StdDev:</b> ${stdDev.toFixed(0)} ms`;
+            sendTelegramAlert(alertText);   // без await — фон
         } else {
             console.log(`[Anti-Cheat] ✅ Room ${roomId} passed fair play check`, {
                 whiteACPL: whiteACPL.toFixed(1),
