@@ -321,7 +321,15 @@ io.on("connection", (socket) => {
                 setTimeout(() => {
                     const stillActive = activeGames.get(roomId);
                     if (stillActive) {
-                        const winner = room.whiteSocket === socket.id ? "black" : "white";
+                                                const winner = room.whiteSocket === socket.id ? "black" : "white";
+
+                        // Запускаем фоновый античит ДО удаления комнаты
+                        const roomToAnalyze = {
+                            id: roomId,
+                            moveHistory: [...room.moveHistory]
+                        };
+                        analyzeForFairPlay(roomToAnalyze);   // без await — фон
+
                         io.to(opponentSocket).emit("opponentForfeit", {
                             winner: winner,
                             reason: "Opponent disconnected for 30+ seconds"
