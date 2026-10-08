@@ -10,7 +10,7 @@
     "express": "^4.18.2",
     "socket.io": "^4.6.1",
     "chess.js": "^0.10.3",
-    "stockfish": "^19.0.0"
+    "@se-oss/stockfish": "^1.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
