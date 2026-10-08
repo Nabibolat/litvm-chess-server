@@ -91,9 +91,14 @@ async function analyzeForFairPlay(room) {
             : 0;
         const stdDev = Math.sqrt(variance);
 
-        const timingSuspicious = times.length > 10 && stdDev < 400;
-        const whiteFlagged = acpl.white.length >= 8 && (whiteACPL < 15 || (whiteACPL < 25 && timingSuspicious));
-        const blackFlagged = acpl.black.length >= 8 && (blackACPL < 15 || (blackACPL < 25 && timingSuspicious));
+                // Тайминг подозрителен, если сыграно ≥8 ходов и разброс времени очень маленький (бот)
+        const timingSuspicious = times.length >= 8 && stdDev < 500;
+
+        // Подозрение на точность:
+        // 1. ACPL < 10 — автофлаг (супер-бот), независимо от таймингов
+        // 2. ACPL < 20 И при этом подозрительные одинаковые тайминги (timingSuspicious)
+        const whiteFlagged = acpl.white.length >= 8 && (whiteACPL < 10 || (whiteACPL < 20 && timingSuspicious));
+        const blackFlagged = acpl.black.length >= 8 && (blackACPL < 10 || (blackACPL < 20 && timingSuspicious));
 
         if (whiteFlagged || blackFlagged) {
             console.warn(`[Anti-Cheat] ⚠️ SUSPICIOUS GAME DETECTED: room ${roomId}`, {
