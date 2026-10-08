@@ -121,6 +121,36 @@ async function analyzeForFairPlay(room) {
         try { if (engine && engine.quit) await engine.quit(); } catch (e) {}
     }
 }
+// ===== TELEGRAM ALERT =====
+async function sendTelegramAlert(text) {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+    if (!token || !chatId) {
+        console.log("[Telegram] Skipped — no token/chatId");
+        return;
+    }
+
+    try {
+        const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                chat_id: chatId,
+                text: text,
+                parse_mode: "HTML"
+            })
+        });
+        const data = await res.json();
+        if (!data.ok) {
+            console.error("[Telegram] API error:", data);
+        } else {
+            console.log("[Telegram] Alert sent");
+        }
+    } catch (err) {
+        console.error("[Telegram] Network error:", err);
+    }
+}
+
 app.get("/", (req, res) => {
     res.send("LitVM Chess WebSocket Server v2 is running");
 });
