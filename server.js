@@ -82,9 +82,18 @@ async function analyzeForFairPlay(room) {
                 acpl[isWhite ? "white" : "black"].push(Math.min(300, singleMoveLoss));
             }
 
-            // UCI сделанного хода — восстанавливаем через replay
-            const mv = replay.move(room.moveHistory[i].san || room.moveHistory[i]);
-            const playedUci = mv ? (mv.from + mv.to + (mv.promotion || "")) : "";
+                        // UCI сделанного хода — надёжное восстановление
+            let playedUci = "";
+            try {
+                const rawMove = room.moveHistory[i];
+                const moveObj = typeof rawMove === "object" ? (rawMove.san || rawMove) : rawMove;
+                const mv = replay.move(moveObj);
+                if (mv) {
+                    playedUci = mv.from + mv.to + (mv.promotion || "");
+                }
+            } catch (e) {
+                console.error(`[Anti-Cheat] Move replay error at index ${i}:`, e);
+            }
 
             if (isWhite) {
                 whiteTotal++;
