@@ -44,18 +44,23 @@ async function analyzeForFairPlay(room) {
             fens.push(tempGame.fen());
         }
 
-        // Оцениваем каждую позицию 1 раз
+                // Оцениваем каждую позицию 1 раз
         const evals = [];
         for (const fen of fens) {
             const analysis = await engine.analyze(fen, 12);
             const score = analysis.lines[0].score;
             let cp = 0;
-            if (score.type === "cp") cp = score.value;
-            else if (score.type === "mate") cp = score.value > 0 ? 10000 : -10000;
+            if (score.type === "cp") {
+                cp = score.value;
+            } else if (score.type === "mate") {
+                cp = score.value > 0 ? 1000 : -1000;
+            }
+            // Каппим оценку позиции в диапазоне [-1000, 1000]
+            cp = Math.max(-1000, Math.min(1000, cp));
             evals.push(cp);
         }
 
-        // ACPL
+                // ACPL
         const acpl = { white: [], black: [] };
         for (let i = 0; i < room.moveHistory.length; i++) {
             const isWhite = (i % 2 === 0);
@@ -66,8 +71,11 @@ async function analyzeForFairPlay(room) {
             if (isWhite) loss = evalBefore - evalAfter;
             else loss = evalAfter - evalBefore;
 
-            if (Math.abs(evalBefore) < 1000) {
-                acpl[isWhite ? "white" : "black"].push(Math.max(0, loss));
+            // Считаем только если позиция не безнадёжна (|evalBefore| < 700)
+            if (Math.abs(evalBefore) < 700) {
+                const singleMoveLoss = Math.max(0, loss);
+                // Каппим потерю за один ход до 300 cp
+                acpl[isWhite ? "white" : "black"].push(Math.min(300, singleMoveLoss));
             }
         }
 
