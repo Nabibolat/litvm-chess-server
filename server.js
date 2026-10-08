@@ -21,37 +21,6 @@ let matchQueue = [];
 let roomCounter = 0;
 // ===== АНТИЧИТ: ФОНОВЫЙ АНАЛИЗ ПАРТИИ =====
 
-function evaluatePosition(engine, fen, depth = 12) {
-    return new Promise((resolve) => {
-        let bestCp = 0;
-
-        // Создаем локальный обработчик
-        const handler = (event) => {
-            const line = typeof event === "string" ? event : (event && event.data ? event.data : "");
-            if (typeof line !== "string") return;
-
-            const match = line.match(/score cp (-?\d+)/);
-            if (match) bestCp = parseInt(match[1], 10);
-
-            const mateMatch = line.match(/score mate (-?\d+)/);
-            if (mateMatch) {
-                const m = parseInt(mateMatch[1], 10);
-                bestCp = m > 0 ? 10000 : -10000;
-            }
-
-            if (line.startsWith("bestmove")) {
-                // Снимаем обработчик после получения bestmove
-                engine.onmessage = null;
-                resolve(bestCp);
-            }
-        };
-
-        engine.onmessage = handler;
-        engine.postMessage(`position fen ${fen}`);
-        engine.postMessage(`go depth ${depth}`);
-    });
-}
-
 async function analyzeForFairPlay(room) {
     const roomId = room.id || "unknown";
     console.log(`[Anti-Cheat] Starting analysis for room ${roomId}...`);
@@ -61,60 +30,52 @@ async function analyzeForFairPlay(room) {
         return;
     }
 
+    let engine = null;
     try {
-        const engine = stockfish();
-        
-        // Настройка параметров движка
-        engine.postMessage("uci");
-        engine.postMessage("setoption name Threads value 1");
-        engine.postMessage("setoption name Hash value 16");
+        const { Stockfish } = require("@se-oss/stockfish");
+        engine = new Stockfish();
+        await engine.waitReady();
 
-        // Собираем FEN всех позиций в партии (от начала до конца)
+        // Собираем FEN всех позиций
         const tempGame = new Chess();
-        const fens = [tempGame.fen()]; // fens[0] - начальная позиция
-        
+        const fens = [tempGame.fen()];
         for (const h of room.moveHistory) {
-            tempGame.move(m.san || m);
+            tempGame.move(h.san || h);
             fens.push(tempGame.fen());
         }
 
-        // Оцениваем каждую позицию ровно 1 раз (всего N+1 оценок вместо 2N)
+        // Оцениваем каждую позицию 1 раз
         const evals = [];
         for (const fen of fens) {
-            const cp = await evaluatePosition(engine, fen, 12);
+            const analysis = await engine.analyze(fen, 12);
+            const score = analysis.lines[0].score;
+            let cp = 0;
+            if (score.type === "cp") cp = score.value;
+            else if (score.type === "mate") cp = score.value > 0 ? 10000 : -10000;
             evals.push(cp);
         }
 
+        // ACPL
         const acpl = { white: [], black: [] };
-
-        // Считаем потерю центипешек на каждом ходе
         for (let i = 0; i < room.moveHistory.length; i++) {
             const isWhite = (i % 2 === 0);
             const evalBefore = evals[i];
             const evalAfter = evals[i + 1];
 
-            // Приводим оценку к взгляду игрока, который делает ход
             let loss = 0;
-            if (isWhite) {
-                // Для белых: чем выше eval, тем лучше. Потеря = evalBefore - evalAfter
-                loss = evalBefore - evalAfter;
-            } else {
-                // Для черных: чем ниже eval, тем лучше (в терминах белых). Потеря = evalAfter - evalBefore
-                loss = evalAfter - evalBefore;
-            }
+            if (isWhite) loss = evalBefore - evalAfter;
+            else loss = evalAfter - evalBefore;
 
-            // Исключаем случаи, когда позиция уже выиграна/проиграна вхлам (>1000 cp)
             if (Math.abs(evalBefore) < 1000) {
                 acpl[isWhite ? "white" : "black"].push(Math.max(0, loss));
             }
         }
 
-        // Средние значения ACPL
         const avg = (arr) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
         const whiteACPL = avg(acpl.white);
         const blackACPL = avg(acpl.black);
 
-        // Дисперсия и стандартное отклонение времени
+        // Дисперсия времени
         const times = room.moveHistory.map(m => m.timeSpentMs).filter(t => typeof t === "number" && t < 60000);
         const avgTime = avg(times);
         const variance = times.length > 0
@@ -122,11 +83,7 @@ async function analyzeForFairPlay(room) {
             : 0;
         const stdDev = Math.sqrt(variance);
 
-        // Подозрения:
-        // 1. Очень низкий ACPL (< 15) при более чем 10 ходах
-        // 2. ИЛИ комбинация ACPL < 25 + подозрительно роботоподобный тайминг (stdDev < 400мс)
         const timingSuspicious = times.length > 10 && stdDev < 400;
-        
         const whiteFlagged = acpl.white.length >= 8 && (whiteACPL < 15 || (whiteACPL < 25 && timingSuspicious));
         const blackFlagged = acpl.black.length >= 8 && (blackACPL < 15 || (blackACPL < 25 && timingSuspicious));
 
@@ -145,14 +102,12 @@ async function analyzeForFairPlay(room) {
                 stdDevMs: stdDev.toFixed(0)
             });
         }
-
-        // Завершаем работу движка
-        try { engine.postMessage("quit"); } catch (e) {}
     } catch (err) {
         console.error(`[Anti-Cheat] Error analyzing room ${roomId}:`, err);
+    } finally {
+        try { if (engine && engine.quit) await engine.quit(); } catch (e) {}
     }
 }
-
 app.get("/", (req, res) => {
     res.send("LitVM Chess WebSocket Server v2 is running");
 });
