@@ -44,8 +44,9 @@ async function analyzeForFairPlay(room) {
             fens.push(tempGame.fen());
         }
 
-                // Оцениваем каждую позицию 1 раз
+                       // Оцениваем каждую позицию 1 раз + собираем top-1 ходы
         const evals = [];
+        const bestMoves = [];   // bestMove для каждой позиции (UCI)
         for (const fen of fens) {
             const analysis = await engine.analyze(fen, 12);
             const score = analysis.lines[0].score;
@@ -55,13 +56,18 @@ async function analyzeForFairPlay(room) {
             } else if (score.type === "mate") {
                 cp = score.value > 0 ? 1000 : -1000;
             }
-            // Каппим оценку позиции в диапазоне [-1000, 1000]
             cp = Math.max(-1000, Math.min(1000, cp));
             evals.push(cp);
+            bestMoves.push(analysis.bestmove || "");   // ← UCI-ход
         }
 
-                // ACPL
+                        // ACPL + Engine Match Rate
         const acpl = { white: [], black: [] };
+        let whiteTop1 = 0, blackTop1 = 0;
+        let whiteTotal = 0, blackTotal = 0;
+
+        // Проигрываем партию заново, чтобы получить UCI каждого хода
+        const replay = new Chess();
         for (let i = 0; i < room.moveHistory.length; i++) {
             const isWhite = (i % 2 === 0);
             const evalBefore = evals[i];
@@ -71,13 +77,26 @@ async function analyzeForFairPlay(room) {
             if (isWhite) loss = evalBefore - evalAfter;
             else loss = evalAfter - evalBefore;
 
-            // Считаем только если позиция не безнадёжна (|evalBefore| < 700)
             if (Math.abs(evalBefore) < 700) {
                 const singleMoveLoss = Math.max(0, loss);
-                // Каппим потерю за один ход до 300 cp
                 acpl[isWhite ? "white" : "black"].push(Math.min(300, singleMoveLoss));
             }
+
+            // UCI сделанного хода — восстанавливаем через replay
+            const mv = replay.move(room.moveHistory[i].san || room.moveHistory[i]);
+            const playedUci = mv ? (mv.from + mv.to + (mv.promotion || "")) : "";
+
+            if (isWhite) {
+                whiteTotal++;
+                if (playedUci && bestMoves[i] && playedUci === bestMoves[i]) whiteTop1++;
+            } else {
+                blackTotal++;
+                if (playedUci && bestMoves[i] && playedUci === bestMoves[i]) blackTop1++;
+            }
         }
+
+        const whiteMatchRate = whiteTotal > 0 ? (whiteTop1 / whiteTotal) * 100 : 0;
+        const blackMatchRate = blackTotal > 0 ? (blackTop1 / blackTotal) * 100 : 0;
 
         const avg = (arr) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
         const whiteACPL = avg(acpl.white);
@@ -92,18 +111,32 @@ async function analyzeForFairPlay(room) {
         const stdDev = Math.sqrt(variance);
 
                 // Тайминг подозрителен, если сыграно ≥8 ходов и разброс времени очень маленький (бот)
-        const timingSuspicious = times.length >= 8 && stdDev < 500;
+                const timingSuspicious = times.length >= 8 && stdDev < 500;
 
-        // Подозрение на точность:
-        // 1. ACPL < 10 — автофлаг (супер-бот), независимо от таймингов
-        // 2. ACPL < 20 И при этом подозрительные одинаковые тайминги (timingSuspicious)
-        const whiteFlagged = acpl.white.length >= 8 && (whiteACPL < 10 || (whiteACPL < 20 && timingSuspicious));
-        const blackFlagged = acpl.black.length >= 8 && (blackACPL < 10 || (blackACPL < 20 && timingSuspicious));
+        // Гибрид: >= 8 ходов + matchRate >= 80% (Gemini: >= 8, наш: 80%)
+        const whiteFlagged = whiteTotal >= 8 && (
+            whiteMatchRate >= 80 ||
+            whiteACPL < 10 ||
+            (whiteACPL < 20 && timingSuspicious)
+        );
+
+        const blackFlagged = blackTotal >= 8 && (
+            blackMatchRate >= 80 ||
+            blackACPL < 10 ||
+            (blackACPL < 20 && timingSuspicious)
+        );
+
+        const result = {
+            white: { acpl: whiteACPL.toFixed(1), matchRate: `${whiteMatchRate.toFixed(1)}%`, flagged: whiteFlagged },
+            black: { acpl: blackACPL.toFixed(1), matchRate: `${blackMatchRate.toFixed(1)}%`, flagged: blackFlagged },
+            avgTimeMs: avgTime.toFixed(0),
+            stdDevMs: stdDev.toFixed(0)
+        };
 
                 if (whiteFlagged || blackFlagged) {
-            console.warn(`[Anti-Cheat] ⚠️ SUSPICIOUS GAME DETECTED: room ${roomId}`, {
-                white: { acpl: whiteACPL.toFixed(1), flagged: whiteFlagged },
-                black: { acpl: blackACPL.toFixed(1), flagged: blackFlagged },
+                        console.warn(`[Anti-Cheat] ⚠️ SUSPICIOUS GAME DETECTED: room ${roomId}`, {
+                white: { acpl: whiteACPL.toFixed(1), matchRate: whiteMatchRate.toFixed(1) + "%", flagged: whiteFlagged },
+                black: { acpl: blackACPL.toFixed(1), matchRate: blackMatchRate.toFixed(1) + "%", flagged: blackFlagged },
                 avgTimeMs: avgTime.toFixed(0),
                 stdDevMs: stdDev.toFixed(0)
             });
@@ -119,9 +152,11 @@ async function analyzeForFairPlay(room) {
 <b>StdDev:</b> ${stdDev.toFixed(0)} ms`;
             sendTelegramAlert(alertText);   // без await — фон
         } else {
-            console.log(`[Anti-Cheat] ✅ Room ${roomId} passed fair play check`, {
+                        console.log(`[Anti-Cheat] ✅ Room ${roomId} passed fair play check`, {
                 whiteACPL: whiteACPL.toFixed(1),
                 blackACPL: blackACPL.toFixed(1),
+                whiteMatchRate: whiteMatchRate.toFixed(1) + "%",
+                blackMatchRate: blackMatchRate.toFixed(1) + "%",
                 avgTimeMs: avgTime.toFixed(0),
                 stdDevMs: stdDev.toFixed(0)
             });
