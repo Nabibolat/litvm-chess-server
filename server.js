@@ -36,10 +36,13 @@ async function analyzeForFairPlay(room) {
         engine = new Stockfish();
         await engine.waitReady();
 
-        // Собираем FEN всех позиций
+                // Берём только первые 20 полуходов (10 ходов каждого) — дебют + миттельшпиль
+        const movesToAnalyze = room.moveHistory.slice(0, 20);
+
+        // Собираем FEN всех позиций (только первые 20)
         const tempGame = new Chess();
         const fens = [tempGame.fen()];
-        for (const h of room.moveHistory) {
+        for (const h of movesToAnalyze) {
             tempGame.move(h.san || h);
             fens.push(tempGame.fen());
         }
@@ -61,14 +64,14 @@ async function analyzeForFairPlay(room) {
             bestMoves.push(analysis.bestmove || "");   // ← UCI-ход
         }
 
-                        // ACPL + Engine Match Rate
+                                // ACPL + Engine Match Rate (только первые 20 полуходов)
         const acpl = { white: [], black: [] };
         let whiteTop1 = 0, blackTop1 = 0;
         let whiteTotal = 0, blackTotal = 0;
 
         // Проигрываем партию заново, чтобы получить UCI каждого хода
         const replay = new Chess();
-        for (let i = 0; i < room.moveHistory.length; i++) {
+        for (let i = 0; i < movesToAnalyze.length; i++) {
             const isWhite = (i % 2 === 0);
             const evalBefore = evals[i];
             const evalAfter = evals[i + 1];
@@ -85,7 +88,7 @@ async function analyzeForFairPlay(room) {
                         // UCI сделанного хода — надёжное восстановление
             let playedUci = "";
             try {
-                const rawMove = room.moveHistory[i];
+                const rawMove = movesToAnalyze[i];
                 const moveObj = typeof rawMove === "object" ? (rawMove.san || rawMove) : rawMove;
                 const mv = replay.move(moveObj);
                 if (mv) {
