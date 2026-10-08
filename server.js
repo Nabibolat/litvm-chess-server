@@ -314,8 +314,15 @@ io.on("connection", (socket) => {
                     : null
             });
 
-            // 6. Освобождаем комнату после матча
+                        // 6. Освобождаем комнату после матча
             if (room.game.game_over()) {
+                // Запускаем фоновый античит-анализ ДО удаления комнаты
+                const roomToAnalyze = {
+                    id: roomId,
+                    moveHistory: [...room.moveHistory]
+                };
+                analyzeForFairPlay(roomToAnalyze);   // без await — фон
+
                 activeGames.delete(roomId);
                 console.log(`Room ${roomId} closed — game over`);
             }
