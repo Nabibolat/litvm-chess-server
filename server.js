@@ -111,17 +111,23 @@ async function analyzeForFairPlay(room) {
         const stdDev = Math.sqrt(variance);
 
                 // Тайминг подозрителен, если сыграно ≥8 ходов и разброс времени очень маленький (бот)
-                const timingSuspicious = times.length >= 8 && stdDev < 500;
+                        const timingSuspicious = times.length >= 8 && stdDev < 500;
 
-        // Гибрид: >= 8 ходов + matchRate >= 80% (Gemini: >= 8, наш: 80%)
-        const whiteFlagged = whiteTotal >= 8 && (
-            whiteMatchRate >= 80 ||
+        // Калибровка (Gemini):
+        // 1. Match Rate >= 65% — очевидный читер
+        // 2. Match Rate >= 50% + ACPL < 40 — подозрительный (подсказки)
+        // 3. ACPL < 10 — супер-бот
+        // 4. ACPL < 20 + timing — стабильный бот
+        const whiteFlagged = whiteTotal >= 6 && (
+            whiteMatchRate >= 65 ||
+            (whiteMatchRate >= 50 && whiteACPL < 40) ||
             whiteACPL < 10 ||
             (whiteACPL < 20 && timingSuspicious)
         );
 
-        const blackFlagged = blackTotal >= 8 && (
-            blackMatchRate >= 80 ||
+        const blackFlagged = blackTotal >= 6 && (
+            blackMatchRate >= 65 ||
+            (blackMatchRate >= 50 && blackACPL < 40) ||
             blackACPL < 10 ||
             (blackACPL < 20 && timingSuspicious)
         );
