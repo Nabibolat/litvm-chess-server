@@ -25,19 +25,20 @@ async function analyzeForFairPlay(room) {
     const roomId = room.id || "unknown";
     console.log(`[Anti-Cheat] Starting analysis for room ${roomId}...`);
 
-    if (!room.moveHistory || room.moveHistory.length < 6) {
-        console.log(`[Anti-Cheat] Room ${roomId} has too few moves to analyze.`);
-        return;
-    }
-
     let engine = null;
     try {
         const { Stockfish } = require("@se-oss/stockfish");
         engine = new Stockfish();
         await engine.waitReady();
 
-                // Берём только первые 20 полуходов (10 ходов каждого) — дебют + миттельшпиль
-        const movesToAnalyze = room.moveHistory.slice(0, 20);
+                       // Пропускаем дебют (первые 8 полных ходов = 16 полуходов).
+        // Анализируем миттельшпиль: с 16-го полухода до 36-го (ходы 8-18).
+        // Если партия короче 8 полных ходов — анализа нет.
+        if (room.moveHistory.length < 16) {
+            console.log(`[Anti-Cheat] Room ${roomId} too short (${room.moveHistory.length} plies), skipping.`);
+            return;
+        }
+        const movesToAnalyze = room.moveHistory.slice(16, 36);
 
         // Собираем FEN всех позиций (только первые 20)
         const tempGame = new Chess();
@@ -64,7 +65,7 @@ async function analyzeForFairPlay(room) {
             bestMoves.push(analysis.bestmove || "");   // ← UCI-ход
         }
 
-                                // ACPL + Engine Match Rate (только первые 20 полуходов)
+                                // ACPL + Engine Match Rate (только миттельшпиль: полуходы 16-35)
         const acpl = { white: [], black: [] };
         let whiteTop1 = 0, blackTop1 = 0;
         let whiteTotal = 0, blackTotal = 0;
