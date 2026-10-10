@@ -52,7 +52,7 @@ async function analyzeForFairPlay(room) {
         const evals = [];
         const bestMoves = [];   // bestMove для каждой позиции (UCI)
         for (const fen of fens) {
-            const analysis = await engine.analyze(fen, 12);
+            const analysis = await engine.analyze(fen, 8);
             const score = analysis.lines[0].score;
             let cp = 0;
             if (score.type === "cp") {
