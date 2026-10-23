@@ -1,449 +1,265 @@
-// LitVM Chess — WebSocket Server v2 (Matchmaking + PvP)
-
 const express = require("express");
 const http = require("http");
+const crypto = require("crypto");
 const { Server } = require("socket.io");
 const { Chess } = require("chess.js");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
-});
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
-// Хранилище активных игр: matchId → { game, white, black }
 const activeGames = new Map();
-
-// Очередь игроков, ожидающих соперника: [{ socketId, userAddress, timeControl }]
 let matchQueue = [];
-
-// Счётчик комнат
 let roomCounter = 0;
-// ===== АНТИЧИТ: ФОНОВЫЙ АНАЛИЗ ПАРТИИ =====
 
-async function analyzeForFairPlay(room) {
-    const roomId = room.id || "unknown";
-    console.log(`[Anti-Cheat] Starting analysis for room ${roomId}...`);
+const RELAY_URL = (process.env.RELAY_URL || "").replace(/\/+$/, "");
+const RELAY_API_SECRET = process.env.RELAY_API_SECRET;
 
-    let engine = null;
-    try {
-        const { Stockfish } = require("@se-oss/stockfish");
-        engine = new Stockfish();
-        await engine.waitReady();
+const ALLOWED_TIME_CONTROLS = new Set([60, 300, 900, 1800]);
+const RESULT_RETRY_MS = 5000;
+const DISCONNECT_GRACE_MS = 30000;
+const REQUEST_TIMEOUT_MS = 15000;
 
-                       // Пропускаем дебют (первые 8 полных ходов = 16 полуходов).
-        // Анализируем миттельшпиль: с 16-го полухода до 36-го (ходы 8-18).
-        // Если партия короче 8 полных ходов — анализа нет.
-        if (room.moveHistory.length < 16) {
-            console.log(`[Anti-Cheat] Room ${roomId} too short (${room.moveHistory.length} plies), skipping.`);
-            return;
-        }
-        const movesToAnalyze = room.moveHistory.slice(16, 36);
-
-        // Собираем FEN всех позиций (только первые 20)
-        const tempGame = new Chess();
-        const fens = [tempGame.fen()];
-        for (const h of movesToAnalyze) {
-            tempGame.move(h.san || h);
-            fens.push(tempGame.fen());
-        }
-
-                       // Оцениваем каждую позицию 1 раз + собираем top-1 ходы
-        const evals = [];
-        const bestMoves = [];   // bestMove для каждой позиции (UCI)
-        for (const fen of fens) {
-            const analysis = await engine.analyze(fen, 8);
-            const score = analysis.lines[0].score;
-            let cp = 0;
-            if (score.type === "cp") {
-                cp = score.value;
-            } else if (score.type === "mate") {
-                cp = score.value > 0 ? 1000 : -1000;
-            }
-            cp = Math.max(-1000, Math.min(1000, cp));
-            evals.push(cp);
-            bestMoves.push(analysis.bestmove || "");   // ← UCI-ход
-        }
-
-                                // ACPL + Engine Match Rate (только миттельшпиль: полуходы 16-35)
-        const acpl = { white: [], black: [] };
-        let whiteTop1 = 0, blackTop1 = 0;
-        let whiteTotal = 0, blackTotal = 0;
-
-        // Проигрываем партию заново, чтобы получить UCI каждого хода
-        const replay = new Chess();
-        for (let i = 0; i < movesToAnalyze.length; i++) {
-            const isWhite = (i % 2 === 0);
-            const evalBefore = evals[i];
-            const evalAfter = evals[i + 1];
-
-            let loss = 0;
-            if (isWhite) loss = evalBefore - evalAfter;
-            else loss = evalAfter - evalBefore;
-
-            if (Math.abs(evalBefore) < 700) {
-                const singleMoveLoss = Math.max(0, loss);
-                acpl[isWhite ? "white" : "black"].push(Math.min(300, singleMoveLoss));
-            }
-
-                        // UCI сделанного хода — надёжное восстановление
-            let playedUci = "";
-            try {
-                const rawMove = movesToAnalyze[i];
-                const moveObj = typeof rawMove === "object" ? (rawMove.san || rawMove) : rawMove;
-                const mv = replay.move(moveObj);
-                if (mv) {
-                    playedUci = mv.from + mv.to + (mv.promotion || "");
-                }
-            } catch (e) {
-                console.error(`[Anti-Cheat] Move replay error at index ${i}:`, e);
-            }
-
-            if (isWhite) {
-                whiteTotal++;
-                if (playedUci && bestMoves[i] && playedUci === bestMoves[i]) whiteTop1++;
-            } else {
-                blackTotal++;
-                if (playedUci && bestMoves[i] && playedUci === bestMoves[i]) blackTop1++;
-            }
-        }
-
-        const whiteMatchRate = whiteTotal > 0 ? (whiteTop1 / whiteTotal) * 100 : 0;
-        const blackMatchRate = blackTotal > 0 ? (blackTop1 / blackTotal) * 100 : 0;
-
-        const avg = (arr) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
-        const whiteACPL = avg(acpl.white);
-        const blackACPL = avg(acpl.black);
-
-        // Дисперсия времени
-        const times = room.moveHistory.map(m => m.timeSpentMs).filter(t => typeof t === "number" && t < 60000);
-        const avgTime = avg(times);
-        const variance = times.length > 0
-            ? times.reduce((a, b) => a + Math.pow(b - avgTime, 2), 0) / times.length
-            : 0;
-        const stdDev = Math.sqrt(variance);
-
-                // Тайминг подозрителен, если сыграно ≥8 ходов и разброс времени очень маленький (бот)
-                        const timingSuspicious = times.length >= 8 && stdDev < 500;
-
-        // Калибровка (Gemini):
-        // 1. Match Rate >= 65% — очевидный читер
-        // 2. Match Rate >= 50% + ACPL < 40 — подозрительный (подсказки)
-        // 3. ACPL < 10 — супер-бот
-        // 4. ACPL < 20 + timing — стабильный бот
-        const whiteFlagged = whiteTotal >= 6 && (
-            whiteMatchRate >= 65 ||
-            (whiteMatchRate >= 50 && whiteACPL < 40) ||
-            whiteACPL < 10 ||
-            (whiteACPL < 20 && timingSuspicious)
-        );
-
-        const blackFlagged = blackTotal >= 6 && (
-            blackMatchRate >= 65 ||
-            (blackMatchRate >= 50 && blackACPL < 40) ||
-            blackACPL < 10 ||
-            (blackACPL < 20 && timingSuspicious)
-        );
-
-        const result = {
-            white: { acpl: whiteACPL.toFixed(1), matchRate: `${whiteMatchRate.toFixed(1)}%`, flagged: whiteFlagged },
-            black: { acpl: blackACPL.toFixed(1), matchRate: `${blackMatchRate.toFixed(1)}%`, flagged: blackFlagged },
-            avgTimeMs: avgTime.toFixed(0),
-            stdDevMs: stdDev.toFixed(0)
-        };
-
-                if (whiteFlagged || blackFlagged) {
-                        console.warn(`[Anti-Cheat] ⚠️ SUSPICIOUS GAME DETECTED: room ${roomId}`, {
-                white: { acpl: whiteACPL.toFixed(1), matchRate: whiteMatchRate.toFixed(1) + "%", flagged: whiteFlagged },
-                black: { acpl: blackACPL.toFixed(1), matchRate: blackMatchRate.toFixed(1) + "%", flagged: blackFlagged },
-                avgTimeMs: avgTime.toFixed(0),
-                stdDevMs: stdDev.toFixed(0)
-            });
-
-            // Telegram alert
-            const alertText =
-`⚠️ <b>SUSPICIOUS GAME</b>
-
-<b>Room:</b> ${roomId}
-<b>White:</b> ACPL ${whiteACPL.toFixed(1)} ${whiteFlagged ? "🚩" : ""}
-<b>Black:</b> ACPL ${blackACPL.toFixed(1)} ${blackFlagged ? "🚩" : ""}
-<b>Avg time:</b> ${avgTime.toFixed(0)} ms
-<b>StdDev:</b> ${stdDev.toFixed(0)} ms`;
-            sendTelegramAlert(alertText);   // без await — фон
-        } else {
-                        console.log(`[Anti-Cheat] ✅ Room ${roomId} passed fair play check`, {
-                whiteACPL: whiteACPL.toFixed(1),
-                blackACPL: blackACPL.toFixed(1),
-                whiteMatchRate: whiteMatchRate.toFixed(1) + "%",
-                blackMatchRate: blackMatchRate.toFixed(1) + "%",
-                avgTimeMs: avgTime.toFixed(0),
-                stdDevMs: stdDev.toFixed(0)
-            });
-        }
-    } catch (err) {
-        console.error(`[Anti-Cheat] Error analyzing room ${roomId}:`, err);
-    } finally {
-        try { if (engine && engine.quit) await engine.quit(); } catch (e) {}
-    }
-}
-// ===== TELEGRAM ALERT =====
-async function sendTelegramAlert(text) {
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
-    if (!token || !chatId) {
-        console.log("[Telegram] Skipped — no token/chatId");
-        return;
-    }
-
-    try {
-        const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                chat_id: chatId,
-                text: text,
-                parse_mode: "HTML"
-            })
-        });
-        const data = await res.json();
-        if (!data.ok) {
-            console.error("[Telegram] API error:", data);
-        } else {
-            console.log("[Telegram] Alert sent");
-        }
-    } catch (err) {
-        console.error("[Telegram] Network error:", err);
-    }
+// Проверяем API chess.js
+const probeGame = new Chess();
+for (const method of ["turn", "move", "fen", "game_over", "in_checkmate", "in_draw"]) {
+  if (typeof probeGame[method] !== "function") {
+    throw new Error(`Unsupported chess.js API: missing ${method}()`);
+  }
 }
 
-app.get("/", (req, res) => {
-    res.send("LitVM Chess WebSocket Server v2 is running");
-});
+async function relayRequest(path, body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${RELAY_URL}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-relay-secret": RELAY_API_SECRET },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `Relay HTTP ${res.status}`);
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function createOnChainMatch(white, black, timeControl) {
+  return relayRequest("/pvp/create-match", { whitePlayer: white, blackPlayer: black, timeControl });
+}
+
+async function submitOnChainResult(matchId, result) {
+  return relayRequest("/pvp/submit-result", { matchId, result });
+}
+
+function clearDisconnectTimer(room) {
+  if (room.disconnectTimer) { clearTimeout(room.disconnectTimer); room.disconnectTimer = null; }
+}
+
+function sendRoom(room, event, payload) { io.to(room.id).emit(event, payload); }
+
+function finishGame(room, result, reason) {
+  if (room.finished) return;
+  if (!["white", "black", "draw"].includes(result)) return;
+
+  room.finished = true;
+  room.pendingResult = result;
+  room.finishReason = reason;
+  clearDisconnectTimer(room);
+
+  sendRoom(room, "gameFinished", { result, reason, onChainStatus: room.onChainReady ? "pending" : "waiting_for_match" });
+  void trySubmitResult(room);
+}
+
+function scheduleResultRetry(room) {
+  if (room.retryTimer || room.resultSubmitted) return;
+  room.retryTimer = setTimeout(() => { room.retryTimer = null; void trySubmitResult(room); }, RESULT_RETRY_MS);
+}
+
+async function trySubmitResult(room) {
+  if (!room.finished || room.resultSubmitted) return;
+  if (!room.onChainReady || room.onChainMatchId == null) return;
+  if (room.submittingResult) return;
+
+  room.submittingResult = true;
+  try {
+    const receipt = await submitOnChainResult(room.onChainMatchId, room.pendingResult);
+    room.resultSubmitted = true;
+    console.log(`[Chain] ${room.id}: result ${room.pendingResult} confirmed`, receipt.txHash || "");
+    sendRoom(room, "onChainResultSaved", { roomId: room.id, matchId: room.onChainMatchId, result: room.pendingResult, txHash: receipt.txHash || null });
+    
+    clearDisconnectTimer(room);
+    if (room.retryTimer) clearTimeout(room.retryTimer);
+    activeGames.delete(room.id);
+  } catch (error) {
+    console.error(`[Chain] Result submission failed for ${room.id}:`, error.message);
+    sendRoom(room, "onChainResultPending", { roomId: room.id, matchId: room.onChainMatchId, result: room.pendingResult });
+    scheduleResultRetry(room);
+  } finally {
+    room.submittingResult = false;
+  }
+}
+
+function startOnChainCreation(room) {
+  void (async () => {
+    try {
+      const data = await createOnChainMatch(room.white, room.black, room.timeControl);
+      room.onChainMatchId = String(data.matchId);
+      room.onChainReady = true;
+      console.log(`[Chain] ${room.id} -> match ${room.onChainMatchId}`);
+      if (room.finished) await trySubmitResult(room);
+    } catch (error) {
+      room.onChainCreationFailed = true;
+      console.error(`[Chain] Could not create match for ${room.id}:`, error.message);
+      sendRoom(room, "onChainCreationFailed", { roomId: room.id, message: "Could not confirm on-chain match creation" });
+    }
+  })();
+}
+
+function createRoom(white, black, timeControl) {
+  const roomId = `room_${++roomCounter}`;
+  const initialTimeMs = timeControl * 1000;
+  const room = {
+    id: roomId, game: new Chess(),
+    white: white.userAddress, black: black.userAddress,
+    whiteSocket: white.socketId, blackSocket: black.socketId,
+    whiteResumeToken: crypto.randomBytes(32).toString("hex"),
+    blackResumeToken: crypto.randomBytes(32).toString("hex"),
+    timeControl,
+    clocks: { white: initialTimeMs, black: initialTimeMs, lastMoveTimestamp: Date.now() },
+    moveHistory: [],
+    onChainMatchId: null, onChainReady: false, onChainCreationFailed: false,
+    pendingResult: null, resultSubmitted: false, submittingResult: false,
+    finished: false, finishReason: null, disconnectTimer: null, retryTimer: null
+  };
+  activeGames.set(roomId, room);
+  return room;
+}
 
 io.on("connection", (socket) => {
-    console.log("Player connected:", socket.id);
+  socket.on("findMatch", (payload = {}) => {
+    const { userAddress } = payload;
+    const timeControl = Number(payload.timeControl);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(userAddress)) return socket.emit("moveError", { message: "Invalid address" });
+    if (!ALLOWED_TIME_CONTROLS.has(timeControl)) return socket.emit("moveError", { message: "Invalid timeControl" });
 
-    // ===== МАТЧМЕЙКИНГ =====
-        socket.on("findMatch", ({ userAddress, timeControl, lichessUsername, lichessElo }) => {
-        console.log(`Find match: ${userAddress}, time: ${timeControl}`);
+    const normalized = userAddress.toLowerCase();
+    matchQueue = matchQueue.filter(p => p.socketId !== socket.id && p.userAddress.toLowerCase() !== normalized);
 
-        // ← НОВОЕ: убираем прошлые записи этого же адреса (защита от двух вкладок)
-        matchQueue = matchQueue.filter(
-            (p) => p.userAddress.toLowerCase() !== userAddress.toLowerCase()
-        );
+    const opponentIndex = matchQueue.findIndex(p => p.timeControl === timeControl && p.userAddress.toLowerCase() !== normalized);
+    if (opponentIndex === -1) {
+      matchQueue.push({ socketId: socket.id, userAddress, timeControl });
+      socket.emit("waitingForOpponent");
+      return;
+    }
 
-        // Ищем соперника в очереди с тем же контролем времени
-        // Сравнение адресов регистронезависимое — MetaMask может вернуть разный регистр
-        const opponentIndex = matchQueue.findIndex(
-            (p) => p.timeControl === timeControl &&
-                   p.userAddress.toLowerCase() !== userAddress.toLowerCase()
-        );
+    const opponent = matchQueue.splice(opponentIndex, 1)[0];
+    const current = { socketId: socket.id, userAddress };
+    const firstIsWhite = Math.random() < 0.5;
+    const white = firstIsWhite ? opponent : current;
+    const black = firstIsWhite ? current : opponent;
+    const room = createRoom(white, black, timeControl);
+    
+    const whiteSocket = io.sockets.sockets.get(white.socketId);
+    const blackSocket = io.sockets.sockets.get(black.socketId);
+    if (!whiteSocket || !blackSocket) { activeGames.delete(room.id); return socket.emit("moveError", { message: "Disconnected" }); }
+    
+    whiteSocket.join(room.id); blackSocket.join(room.id);
+    
+    whiteSocket.emit("matchFound", { roomId: room.id, color: "white", opponentAddress: room.black, timeControl, resumeToken: room.whiteResumeToken });
+    blackSocket.emit("matchFound", { roomId: room.id, color: "black", opponentAddress: room.white, timeControl, resumeToken: room.blackResumeToken });
+    
+    sendRoom(room, "gameState", { fen: room.game.fen(), clocks: room.clocks });
+    startOnChainCreation(room);
+  });
 
-        if (opponentIndex === -1) {
-            // Соперника нет — ставим в очередь
-            matchQueue.push({ socketId: socket.id, userAddress, timeControl, lichessUsername, lichessElo });
-            socket.emit("waitingForOpponent");
-            console.log(`Queued: ${userAddress}`);
-        } else {
-            // Соперник найден!
-            const opponent = matchQueue.splice(opponentIndex, 1)[0];
-            const roomId = "room_" + (++roomCounter);
+  socket.on("resumeGame", (payload = {}) => {
+    const { roomId, resumeToken } = payload;
+    const room = activeGames.get(roomId);
+    if (!room || typeof resumeToken !== "string") return socket.emit("resumeFailed", { message: "Game cannot be resumed" });
 
-            // Рандомно назначаем цвета
-            const isFirstWhite = Math.random() < 0.5;
-            const white = isFirstWhite ? opponent : { socketId: socket.id, userAddress };
-            const black = isFirstWhite ? { socketId: socket.id, userAddress } : opponent;
+    let color = null;
+    if (resumeToken === room.whiteResumeToken) color = "white";
+    if (resumeToken === room.blackResumeToken) color = "black";
+    if (!color) return socket.emit("resumeFailed", { message: "Invalid token" });
+    if (room.finished) return socket.emit("resumeFailed", { message: "Game finished" });
 
-            // Создаём игру
-                        const initialTimeMs = timeControl * 1000;
-            activeGames.set(roomId, {
-                game: new Chess(),
-                white: white.userAddress,
-                black: black.userAddress,
-                whiteSocket: white.socketId,
-                blackSocket: black.socketId,
-                timeControl: timeControl,
-                clocks: {
-                    white: initialTimeMs,
-                    black: initialTimeMs,
-                    lastMoveTimestamp: Date.now()
-                },
-                moveHistory: []
-            });
+    clearDisconnectTimer(room);
+    if (color === "white") room.whiteSocket = socket.id; else room.blackSocket = socket.id;
+    socket.join(room.id);
+    io.to(color === "white" ? room.blackSocket : room.whiteSocket).emit("opponentReconnected", { roomId: room.id });
+    socket.emit("gameResumed", { roomId: room.id, color, fen: room.game.fen(), clocks: room.clocks, moveHistory: room.moveHistory, onChainMatchId: room.onChainMatchId });
+  });
 
-            // Подключаем обоих в комнату
-            io.sockets.sockets.get(opponent.socketId)?.join(roomId);
-            io.sockets.sockets.get(socket.id)?.join(roomId);
+  socket.on("makeMove", (payload = {}) => {
+    const { roomId, from, to, promotion } = payload;
+    const room = activeGames.get(roomId);
+    if (!room || room.finished || room.game.game_over()) return socket.emit("moveError", { message: "Game has finished or not found" });
 
-            // Сообщаем обоим
-                        io.to(opponent.socketId).emit("matchFound", {
-                roomId: roomId,
-                color: isFirstWhite ? "white" : "black",
-                opponentAddress: userAddress,
-                opponentLichess: lichessUsername || null,
-                opponentElo: lichessElo || null,
-                timeControl: timeControl
-            });
+    const currentTurn = room.game.turn();
+    const expectedSocket = currentTurn === "w" ? room.whiteSocket : room.blackSocket;
+    if (socket.id !== expectedSocket) return socket.emit("moveError", { message: "Not your turn" });
 
-            io.to(socket.id).emit("matchFound", {
-                roomId: roomId,
-                color: isFirstWhite ? "black" : "white",
-                opponentAddress: opponent.userAddress,
-                opponentLichess: opponent.lichessUsername || null,
-                opponentElo: opponent.lichessElo || null,
-                timeControl: timeControl
-            });
+    try {
+      const now = Date.now();
+      const timeSpent = now - room.clocks.lastMoveTimestamp;
+      const playerColor = currentTurn === "w" ? "white" : "black";
 
-            // ← НОВОЕ: стартовый FEN обоим — клиент синхронизируется до первого хода
-            const startFen = activeGames.get(roomId).game.fen();
-            io.to(opponent.socketId).emit("gameState", { fen: startFen });
-            io.to(socket.id).emit("gameState", { fen: startFen });
+      if (room.clocks[playerColor] - timeSpent <= 0) {
+        const winner = playerColor === "white" ? "black" : "white";
+        room.clocks[playerColor] = 0;
+        sendRoom(room, "moveMade", { isGameOver: true, isCheckmate: false, isDraw: false, winner, reason: "timeout", clocks: room.clocks });
+        finishGame(room, winner, "timeout");
+        return;
+      }
 
-            console.log(`Match created: ${roomId} (${white.userAddress} vs ${black.userAddress})`);
-        }
-    });
+      const move = room.game.move({ from, to, promotion: promotion || "q" });
+      if (!move) return socket.emit("moveError", { message: "Illegal move" });
+      
+      room.clocks[playerColor] -= timeSpent;
+      room.clocks.lastMoveTimestamp = now;
+      room.moveHistory.push({ san: move.san, from: move.from, to: move.to, timeSpentMs: timeSpent, timestamp: now, turn: currentTurn });
 
-    // Отмена поиска
-    socket.on("cancelFindMatch", () => {
-        matchQueue = matchQueue.filter((p) => p.socketId !== socket.id);
-        socket.emit("searchCancelled");
-    });
+      const isGameOver = room.game.game_over();
+      const isCheckmate = room.game.in_checkmate();
+      const isDraw = room.game.in_draw();
+      const winner = isCheckmate ? (room.game.turn() === "w" ? "black" : "white") : null;
 
-        // ===== ИГРА =====
-    socket.on("makeMove", ({ roomId, from, to, promotion }) => {
-        const room = activeGames.get(roomId);
-        if (!room) {
-            socket.emit("moveError", { message: "Game not found" });
-            return;
-        }
+      sendRoom(room, "moveMade", { from: move.from, to: move.to, san: move.san, fen: room.game.fen(), turn: room.game.turn(), clocks: room.clocks, isGameOver, isCheckmate, isDraw, winner });
 
-        // КРИТИЧЕСКАЯ ПРОВЕРКА: Игрок может ходить только за себя
-        const currentTurn = room.game.turn(); // 'w' или 'b'
-        const expectedSocket = currentTurn === 'w' ? room.whiteSocket : room.blackSocket;
+      if (isGameOver) finishGame(room, isCheckmate ? winner : "draw", isCheckmate ? "checkmate" : "draw");
+    } catch (error) {
+      socket.emit("moveError", { message: error.message });
+    }
+  });
 
-        if (socket.id !== expectedSocket) {
-            socket.emit("moveError", { message: "Not your turn" });
-            return;
-        }
+  socket.on("disconnect", () => {
+    matchQueue = matchQueue.filter(p => p.socketId !== socket.id);
+    for (const room of activeGames.values()) {
+      if (room.finished) continue;
+      const color = room.whiteSocket === socket.id ? "white" : (room.blackSocket === socket.id ? "black" : null);
+      if (!color) continue;
 
-        try {
-            const now = Date.now();
-            const timeSpent = now - room.clocks.lastMoveTimestamp;
-            const playerColor = currentTurn === 'w' ? 'white' : 'black';
+      clearDisconnectTimer(room);
+      const opponentSocket = color === "white" ? room.blackSocket : room.whiteSocket;
+      io.to(opponentSocket).emit("opponentDisconnected", { roomId: room.id, message: "Opponent disconnected." });
 
-            // 1. Проверяем таймаут
-            if (room.clocks[playerColor] - timeSpent <= 0) {
-                const winner = playerColor === 'white' ? 'black' : 'white';
-                io.to(roomId).emit("moveMade", {
-                    from: null, to: null, san: null,
-                    fen: room.game.fen(),
-                    turn: room.game.turn(),
-                    isGameOver: true,
-                    isCheckmate: false,
-                    isDraw: false,
-                    winner: winner,
-                    reason: "timeout"
-                });
-                activeGames.delete(roomId);
-                console.log(`Room ${roomId} closed — ${winner} wins on time`);
-                return;
-            }
-
-            // 2. Валидация хода
-            const move = room.game.move({ from, to, promotion: promotion || "q" });
-            if (!move) {
-                socket.emit("moveError", { message: "Illegal move" });
-                return;
-            }
-
-            // 3. Списываем время
-            room.clocks[playerColor] -= timeSpent;
-            room.clocks.lastMoveTimestamp = now;
-
-            // 4. Логируем для античита
-            room.moveHistory.push({
-                san: move.san,
-                timeSpentMs: timeSpent,
-                timestamp: now,
-                turn: currentTurn
-            });
-
-            // 5. Рассылаем ход
-            io.to(roomId).emit("moveMade", {
-                from: move.from,
-                to: move.to,
-                san: move.san,
-                fen: room.game.fen(),
-                turn: room.game.turn(),
-                clocks: room.clocks,
-                isGameOver: room.game.game_over(),
-                isCheckmate: room.game.in_checkmate(),
-                isDraw: room.game.in_draw(),
-                winner: room.game.in_checkmate() 
-                    ? (room.game.turn() === "w" ? "black" : "white") 
-                    : null
-            });
-
-            // 6. Освобождаем комнату после матча
-            if (room.game.game_over()) {
-                // ВРЕМЕННО ОТКЛЮЧАЕМ АНТИЧИТ, ЧТОБЫ СЕРВЕР НЕ ПАДАЛ
-                // const roomToAnalyze = { id: roomId, moveHistory: [...room.moveHistory] };
-                // analyzeForFairPlay(roomToAnalyze); 
-                
-                activeGames.delete(roomId);
-                console.log(`Room ${roomId} closed — game over`);
-            }
-        } catch (e) {
-            socket.emit("moveError", { message: e.message });
-        }
-    });
-
-    // ===== ОТКЛЮЧЕНИЕ =====
-    socket.on("disconnect", () => {
-        console.log("Player disconnected:", socket.id);
-        
-        // Убираем из очереди
-        matchQueue = matchQueue.filter((p) => p.socketId !== socket.id);
-
-        // Ищем комнату, где был этот сокет
-        for (const [roomId, room] of activeGames.entries()) {
-            if (room.whiteSocket === socket.id || room.blackSocket === socket.id) {
-                const opponentSocket = room.whiteSocket === socket.id 
-                    ? room.blackSocket 
-                    : room.whiteSocket;
-                
-                // Сообщаем сопернику об отключении
-                io.to(opponentSocket).emit("opponentDisconnected", {
-                    message: "Opponent disconnected. 30 seconds to reconnect or you win."
-                });
-
-                // Таймер на 30 секунд
-                setTimeout(() => {
-                    const stillActive = activeGames.get(roomId);
-                    if (stillActive) {
-                                                const winner = room.whiteSocket === socket.id ? "black" : "white";
-
-                        // Запускаем фоновый античит ДО удаления комнаты
-                        const roomToAnalyze = {
-                            id: roomId,
-                            moveHistory: [...room.moveHistory]
-                        };
-                        analyzeForFairPlay(roomToAnalyze);   // без await — фон
-
-                        io.to(opponentSocket).emit("opponentForfeit", {
-                            winner: winner,
-                            reason: "Opponent disconnected for 30+ seconds"
-                        });
-                        activeGames.delete(roomId);
-                        console.log(`Room ${roomId} closed — ${winner} wins by disconnect`);
-                    }
-                }, 30000);
-            }
-        }
-    });
+      const disconnectedSocketId = socket.id;
+      room.disconnectTimer = setTimeout(() => {
+        room.disconnectTimer = null;
+        const currentSocket = color === "white" ? room.whiteSocket : room.blackSocket;
+        if (activeGames.get(room.id) !== room || room.finished || currentSocket !== disconnectedSocketId) return;
+        const winner = color === "white" ? "black" : "white";
+        sendRoom(room, "opponentForfeit", { winner, reason: "disconnect_timeout" });
+        finishGame(room, winner, "disconnect_timeout");
+      }, DISCONNECT_GRACE_MS);
+    }
+  });
 });
 
-const PORT = process.env.PORT || 7860;
+const PORT = Number(process.env.PORT || 7860);
 server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+  console.log(`[Chess server] Listening on port ${PORT}`);
 });
