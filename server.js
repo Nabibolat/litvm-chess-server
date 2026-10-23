@@ -309,7 +309,7 @@ io.on("connection", (socket) => {
         socket.emit("searchCancelled");
     });
 
-    // ===== ИГРА =====
+        // ===== ИГРА =====
     socket.on("makeMove", ({ roomId, from, to, promotion }) => {
         const room = activeGames.get(roomId);
         if (!room) {
@@ -317,13 +317,21 @@ io.on("connection", (socket) => {
             return;
         }
 
+        // КРИТИЧЕСКАЯ ПРОВЕРКА: Игрок может ходить только за себя
+        const currentTurn = room.game.turn(); // 'w' или 'b'
+        const expectedSocket = currentTurn === 'w' ? room.whiteSocket : room.blackSocket;
+
+        if (socket.id !== expectedSocket) {
+            socket.emit("moveError", { message: "Not your turn" });
+            return;
+        }
+
         try {
             const now = Date.now();
             const timeSpent = now - room.clocks.lastMoveTimestamp;
-            const currentTurn = room.game.turn();            // 'w' или 'b'
             const playerColor = currentTurn === 'w' ? 'white' : 'black';
 
-            // 1. Проверяем таймаут: если игрок просрочил — победа соперника
+            // 1. Проверяем таймаут
             if (room.clocks[playerColor] - timeSpent <= 0) {
                 const winner = playerColor === 'white' ? 'black' : 'white';
                 io.to(roomId).emit("moveMade", {
@@ -341,14 +349,14 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            // 2. Валидация хода через chess.js
+            // 2. Валидация хода
             const move = room.game.move({ from, to, promotion: promotion || "q" });
             if (!move) {
                 socket.emit("moveError", { message: "Illegal move" });
                 return;
             }
 
-            // 3. Списываем время с часов игрока
+            // 3. Списываем время
             room.clocks[playerColor] -= timeSpent;
             room.clocks.lastMoveTimestamp = now;
 
@@ -360,7 +368,7 @@ io.on("connection", (socket) => {
                 turn: currentTurn
             });
 
-            // 5. Рассылаем ход + актуальные часы
+            // 5. Рассылаем ход
             io.to(roomId).emit("moveMade", {
                 from: move.from,
                 to: move.to,
@@ -376,15 +384,12 @@ io.on("connection", (socket) => {
                     : null
             });
 
-                        // 6. Освобождаем комнату после матча
+            // 6. Освобождаем комнату после матча
             if (room.game.game_over()) {
-                // Запускаем фоновый античит-анализ ДО удаления комнаты
-                const roomToAnalyze = {
-                    id: roomId,
-                    moveHistory: [...room.moveHistory]
-                };
-                analyzeForFairPlay(roomToAnalyze);   // без await — фон
-
+                // ВРЕМЕННО ОТКЛЮЧАЕМ АНТИЧИТ, ЧТОБЫ СЕРВЕР НЕ ПАДАЛ
+                // const roomToAnalyze = { id: roomId, moveHistory: [...room.moveHistory] };
+                // analyzeForFairPlay(roomToAnalyze); 
+                
                 activeGames.delete(roomId);
                 console.log(`Room ${roomId} closed — game over`);
             }
