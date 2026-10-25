@@ -109,7 +109,13 @@ function startOnChainCreation(room) {
       room.onChainMatchId = String(data.matchId);
       room.onChainReady = true;
       console.log(`[Chain] ${room.id} -> match ${room.onChainMatchId}`);
-      if (room.finished) await trySubmitResult(room);
+
+      // Отправляем matchId клиентам
+      sendRoom(room, "onChainMatchCreated", { matchId: room.onChainMatchId });
+
+      if (room.finished) {
+        await trySubmitResult(room);
+      }
     } catch (error) {
       room.onChainCreationFailed = true;
       console.error(`[Chain] Could not create match for ${room.id}:`, error.message);
@@ -117,7 +123,6 @@ function startOnChainCreation(room) {
     }
   })();
 }
-
 function createRoom(white, black, timeControl) {
   const roomId = `room_${++roomCounter}`;
   const initialTimeMs = timeControl * 1000;
