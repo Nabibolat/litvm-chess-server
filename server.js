@@ -150,6 +150,13 @@ io.on("connection", (socket) => {
     const tgPhoto = typeof payload.tgPhoto === "string" && /^https:\/\//i.test(payload.tgPhoto)
       ? payload.tgPhoto.slice(0, 2048)
       : null;
+    // Log presence only; avoid storing full profile-photo URLs in production logs.
+    console.log("[findMatch] profile received:", {
+      socketId: socket.id,
+      tgName: tgName || "(missing)",
+      hasTgPhoto: Boolean(tgPhoto),
+      timeControl: payload.timeControl
+    });
     const timeControl = Number(payload.timeControl);
     if (!/^0x[a-fA-F0-9]{40}$/.test(userAddress)) return socket.emit("moveError", { message: "Invalid address" });
     if (!ALLOWED_TIME_CONTROLS.has(timeControl)) return socket.emit("moveError", { message: "Invalid timeControl" });
