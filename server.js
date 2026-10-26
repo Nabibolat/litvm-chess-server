@@ -146,6 +146,10 @@ function createRoom(white, black, timeControl) {
 io.on("connection", (socket) => {
   socket.on("findMatch", (payload = {}) => {
     const { userAddress } = payload;
+    const tgName = typeof payload.tgName === "string" ? payload.tgName.trim().slice(0, 80) : "";
+    const tgPhoto = typeof payload.tgPhoto === "string" && /^https:\/\//i.test(payload.tgPhoto)
+      ? payload.tgPhoto.slice(0, 2048)
+      : null;
     const timeControl = Number(payload.timeControl);
     if (!/^0x[a-fA-F0-9]{40}$/.test(userAddress)) return socket.emit("moveError", { message: "Invalid address" });
     if (!ALLOWED_TIME_CONTROLS.has(timeControl)) return socket.emit("moveError", { message: "Invalid timeControl" });
@@ -155,13 +159,13 @@ io.on("connection", (socket) => {
 
     const opponentIndex = matchQueue.findIndex(p => p.timeControl === timeControl && p.userAddress.toLowerCase() !== normalized);
     if (opponentIndex === -1) {
-      matchQueue.push({ socketId: socket.id, userAddress, timeControl });
+      matchQueue.push({ socketId: socket.id, userAddress, timeControl, tgName, tgPhoto });
       socket.emit("waitingForOpponent");
       return;
     }
 
     const opponent = matchQueue.splice(opponentIndex, 1)[0];
-    const current = { socketId: socket.id, userAddress };
+    const current = { socketId: socket.id, userAddress, tgName, tgPhoto };
     const firstIsWhite = Math.random() < 0.5;
     const white = firstIsWhite ? opponent : current;
     const black = firstIsWhite ? current : opponent;
@@ -173,8 +177,16 @@ io.on("connection", (socket) => {
     
     whiteSocket.join(room.id); blackSocket.join(room.id);
     
-    whiteSocket.emit("matchFound", { roomId: room.id, color: "white", opponentAddress: room.black, timeControl, resumeToken: room.whiteResumeToken });
-    blackSocket.emit("matchFound", { roomId: room.id, color: "black", opponentAddress: room.white, timeControl, resumeToken: room.blackResumeToken });
+    whiteSocket.emit("matchFound", {
+      roomId: room.id, color: "white", opponentAddress: room.black,
+      opponentName: black.tgName || "Anonymous", opponentPhoto: black.tgPhoto || null,
+      timeControl, resumeToken: room.whiteResumeToken
+    });
+    blackSocket.emit("matchFound", {
+      roomId: room.id, color: "black", opponentAddress: room.white,
+      opponentName: white.tgName || "Anonymous", opponentPhoto: white.tgPhoto || null,
+      timeControl, resumeToken: room.blackResumeToken
+    });
     
     sendRoom(room, "gameState", { fen: room.game.fen(), clocks: room.clocks });
     startOnChainCreation(room);
