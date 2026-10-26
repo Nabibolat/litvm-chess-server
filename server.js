@@ -199,6 +199,60 @@ io.on("connection", (socket) => {
     startOnChainCreation(room);
   });
 
+
+  socket.on("createPrivateRoom", (payload = {}) => {
+    const { userAddress } = payload;
+    const timeControl = Number(payload.timeControl);
+    const tgName = typeof payload.tgName === "string" ? payload.tgName.trim().slice(0, 80) : "";
+    const tgPhoto = typeof payload.tgPhoto === "string" && /^https:\/\//i.test(payload.tgPhoto) ? payload.tgPhoto.slice(0, 2048) : null;
+    if (typeof userAddress !== "string" || !/^0x[a-fA-F0-9]{40}$/.test(userAddress)) return socket.emit("privateRoomError", { message: "Invalid address" });
+    if (!ALLOWED_TIME_CONTROLS.has(timeControl)) return socket.emit("privateRoomError", { message: "Invalid timeControl" });
+    matchQueue = matchQueue.filter(p => p.socketId !== socket.id);
+    const placeholder = "0x0000000000000000000000000000000000000000";
+    const room = createRoom({ userAddress, socketId: socket.id, tgName, tgPhoto }, { userAddress: placeholder, socketId: null }, timeControl);
+    room.isPrivate = true;
+    room.whiteName = tgName;
+    room.whitePhoto = tgPhoto;
+    socket.join(room.id);
+    socket.emit("privateRoomCreated", { roomId: room.id, timeControl });
+    console.log(`[Private] Room ${room.id} created by ${userAddress}`);
+  });
+
+  socket.on("joinPrivateRoom", (payload = {}) => {
+    const { roomId, userAddress } = payload;
+    const room = typeof roomId === "string" ? activeGames.get(roomId) : null;
+    const tgName = typeof payload.tgName === "string" ? payload.tgName.trim().slice(0, 80) : "";
+    const tgPhoto = typeof payload.tgPhoto === "string" && /^https:\/\//i.test(payload.tgPhoto) ? payload.tgPhoto.slice(0, 2048) : null;
+    if (!room) return socket.emit("privateRoomError", { message: "Room not found or invite expired" });
+    if (!room.isPrivate) return socket.emit("privateRoomError", { message: "Not a private room" });
+    if (room.blackSocket !== null) return socket.emit("privateRoomError", { message: "Room is full" });
+    if (room.whiteSocket === socket.id || (typeof userAddress === "string" && userAddress.toLowerCase() === room.white.toLowerCase())) return socket.emit("privateRoomError", { message: "You cannot join your own invite" });
+    if (typeof userAddress !== "string" || !/^0x[a-fA-F0-9]{40}$/.test(userAddress)) return socket.emit("privateRoomError", { message: "Invalid address. Please log in first." });
+    const whiteSocket = io.sockets.sockets.get(room.whiteSocket);
+    if (!whiteSocket) {
+      activeGames.delete(room.id);
+      return socket.emit("privateRoomError", { message: "Room creator disconnected. Ask them for a new invite." });
+    }
+    room.blackSocket = socket.id;
+    room.black = userAddress;
+    room.blackName = tgName;
+    room.blackPhoto = tgPhoto;
+    socket.join(room.id);
+    whiteSocket.emit("matchFound", {
+      roomId: room.id, color: "white", opponentAddress: room.black,
+      opponentName: room.blackName || "Anonymous", opponentPhoto: room.blackPhoto || null,
+      timeControl: room.timeControl, resumeToken: room.whiteResumeToken
+    });
+    socket.emit("matchFound", {
+      roomId: room.id, color: "black", opponentAddress: room.white,
+      opponentName: room.whiteName || "Anonymous", opponentPhoto: room.whitePhoto || null,
+      timeControl: room.timeControl, resumeToken: room.blackResumeToken
+    });
+    sendRoom(room, "gameState", { fen: room.game.fen(), clocks: room.clocks });
+    startOnChainCreation(room);
+    console.log(`[Private] Match started in ${room.id}`);
+  });
+
   socket.on("resumeGame", (payload = {}) => {
     const { roomId, resumeToken } = payload;
     const room = activeGames.get(roomId);
