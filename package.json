@@ -1,7 +1,7 @@
 {
-  "name": "litvm-chess-server",
+  "name": "chessgram-server",
   "version": "1.0.0",
-  "description": "WebSocket server for LitVM Chess PvP",
+  "description": "Authenticated realtime multiplayer server for ChessGram",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
