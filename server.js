@@ -5,330 +5,379 @@ const { Server } = require("socket.io");
 const { Chess } = require("chess.js");
 
 const app = express();
+app.use(express.json({ limit: "32kb" }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
 const activeGames = new Map();
 let matchQueue = [];
 let roomCounter = 0;
-
-const RELAY_URL = (process.env.RELAY_URL || "").replace(/\/+$/, "");
-const RELAY_API_SECRET = process.env.RELAY_API_SECRET;
-
 const ALLOWED_TIME_CONTROLS = new Set([60, 300, 900, 1800]);
 const RESULT_RETRY_MS = 5000;
 const DISCONNECT_GRACE_MS = 30000;
-const REQUEST_TIMEOUT_MS = 15000;
+const REQUEST_TIMEOUT_MS = 12000;
 
-// Проверяем API chess.js
-const probeGame = new Chess();
-for (const method of ["turn", "move", "fen", "game_over", "in_checkmate", "in_draw"]) {
-  if (typeof probeGame[method] !== "function") {
-    throw new Error(`Unsupported chess.js API: missing ${method}()`);
-  }
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const SESSION_SECRET = process.env.SESSION_SECRET || "";
+
+if (!TELEGRAM_BOT_TOKEN || !SESSION_SECRET || !SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+  console.warn("[ChessGram] Missing TELEGRAM_BOT_TOKEN, SESSION_SECRET, SUPABASE_URL or SUPABASE_SECRET_KEY");
 }
 
-async function relayRequest(path, body) {
+const probe = new Chess();
+for (const method of ["turn", "move", "fen", "game_over", "in_checkmate", "in_draw", "pgn"]) {
+  if (typeof probe[method] !== "function") throw new Error("Unsupported chess.js API: missing " + method + "()");
+}
+
+function safeEqual(a, b) {
+  const left = Buffer.from(String(a || ""));
+  const right = Buffer.from(String(b || ""));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function verifyTelegramInitData(initData) {
+  if (!TELEGRAM_BOT_TOKEN || typeof initData !== "string" || !initData || initData.length > 16384) return null;
+  const params = new URLSearchParams(initData);
+  const receivedHash = params.get("hash");
+  if (!receivedHash || !/^[a-f0-9]{64}$/i.test(receivedHash)) return null;
+  params.delete("hash");
+  const checkString = [...params.entries()].sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => key + "=" + value).join("\n");
+  const secretKey = crypto.createHmac("sha256", "WebAppData").update(TELEGRAM_BOT_TOKEN).digest();
+  const calculated = crypto.createHmac("sha256", secretKey).update(checkString).digest("hex");
+  if (!safeEqual(calculated, receivedHash.toLowerCase())) return null;
+
+  const authDate = Number(params.get("auth_date"));
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(authDate) || authDate > now + 30 || now - authDate > 300) return null;
+  try {
+    const user = JSON.parse(params.get("user") || "null");
+    if (!user || !Number.isSafeInteger(Number(user.id)) || Number(user.id) <= 0) return null;
+    return user;
+  } catch (_) { return null; }
+}
+
+function signSession(user) {
+  const now = Math.floor(Date.now() / 1000);
+  const payload = { sub: String(user.id), username: user.username || "", firstName: user.first_name || "", lastName: user.last_name || "", photoUrl: user.photo_url || null, iat: now, exp: now + 3600 };
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const input = header + "." + body;
+  const signature = crypto.createHmac("sha256", SESSION_SECRET).update(input).digest("base64url");
+  return input + "." + signature;
+}
+
+function verifySession(token) {
+  if (!SESSION_SECRET || typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const input = parts[0] + "." + parts[1];
+  const expected = crypto.createHmac("sha256", SESSION_SECRET).update(input).digest("base64url");
+  if (!safeEqual(expected, parts[2])) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    if (!payload.sub || !/^\d+$/.test(payload.sub) || !Number.isSafeInteger(payload.exp) || payload.exp <= Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch (_) { return null; }
+}
+
+async function supabaseRequest(path, options = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) throw new Error("Supabase server credentials are not configured");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(`${RELAY_URL}${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-relay-secret": RELAY_API_SECRET },
-      body: JSON.stringify(body),
-      signal: controller.signal
+    const response = await fetch(SUPABASE_URL + "/rest/v1/" + path, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        apikey: SUPABASE_SECRET_KEY,
+        Authorization: "Bearer " + SUPABASE_SECRET_KEY,
+        "Content-Type": "application/json",
+        ...(options.headers || {})
+      }
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) throw new Error(data.error || `Relay HTTP ${res.status}`);
-    return data;
-  } finally {
-    clearTimeout(timer);
+    const body = await response.text();
+    if (!response.ok) throw new Error("Supabase HTTP " + response.status + ": " + body.slice(0, 400));
+    return body ? JSON.parse(body) : null;
+  } finally { clearTimeout(timer); }
+}
+
+async function upsertPlayer(user) {
+  const row = {
+    id: String(user.id),
+    first_name: String(user.first_name || "").slice(0, 80) || null,
+    last_name: String(user.last_name || "").slice(0, 80) || null,
+    username: String(user.username || "").slice(0, 80) || null,
+    photo_url: typeof user.photo_url === "string" && /^https:\/\//i.test(user.photo_url) ? user.photo_url.slice(0, 2048) : null,
+    updated_at: new Date().toISOString()
+  };
+  await supabaseRequest("players?on_conflict=id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify(row)
+  });
+}
+
+function bearerUser(req) {
+  const header = req.get("authorization") || "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return match ? verifySession(match[1]) : null;
+}
+
+app.post("/auth/telegram", async (req, res) => {
+  try {
+    const user = verifyTelegramInitData(req.body && req.body.initData);
+    if (!user) return res.status(401).json({ ok: false, error: "Invalid or expired Telegram authentication" });
+    await upsertPlayer(user);
+    return res.json({
+      ok: true,
+      sessionToken: signSession(user),
+      expiresIn: 3600,
+      telegramId: String(user.id),
+      username: user.username || "",
+      firstName: user.first_name || "",
+      lastName: user.last_name || "",
+      photoUrl: user.photo_url || null
+    });
+  } catch (error) {
+    console.error("[auth] failed:", error.message);
+    return res.status(503).json({ ok: false, error: "Authentication service temporarily unavailable" });
   }
-}
+});
 
-async function createOnChainMatch(white, black, timeControl) {
-  return relayRequest("/pvp/create-match", { whitePlayer: white, blackPlayer: black, timeControl });
-}
+app.get("/api/me", async (req, res) => {
+  const user = bearerUser(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const rows = await supabaseRequest("players?select=id,first_name,last_name,username,photo_url,games_played,wins,losses,draws&id=eq." + encodeURIComponent(user.sub) + "&limit=1");
+    res.json({ player: rows && rows[0] || null });
+  } catch (error) { res.status(503).json({ error: "Could not load player profile" }); }
+});
 
-async function submitOnChainResult(matchId, result) {
-  return relayRequest("/pvp/submit-result", { matchId, result });
-}
+app.get("/api/matches", async (req, res) => {
+  const user = bearerUser(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const id = encodeURIComponent(user.sub);
+    const rows = await supabaseRequest("matches?select=id,room_id,white_player_id,black_player_id,result,pgn,time_control,created_at,finished_at,finish_reason,duration_seconds&or=(white_player_id.eq." + id + ",black_player_id.eq." + id + ")&order=created_at.desc&limit=50");
+    res.json({ matches: rows || [] });
+  } catch (error) { res.status(503).json({ error: "Could not load match history" }); }
+});
+
+app.get("/health", (_req, res) => res.json({ ok: true, service: "ChessGram PvP" }));
+
+io.use((socket, next) => {
+  const token = socket.handshake.auth && socket.handshake.auth.token;
+  const user = verifySession(token);
+  if (!user) return next(new Error("Unauthorized"));
+  socket.data.player = user;
+  next();
+});
 
 function clearDisconnectTimer(room) {
   if (room.disconnectTimer) { clearTimeout(room.disconnectTimer); room.disconnectTimer = null; }
 }
-
 function sendRoom(room, event, payload) { io.to(room.id).emit(event, payload); }
 
 function finishGame(room, result, reason) {
-  if (room.finished) return;
-  if (!["white", "black", "draw"].includes(result)) return;
-
+  if (room.finished || !["white", "black", "draw"].includes(result)) return;
   room.finished = true;
   room.pendingResult = result;
   room.finishReason = reason;
+  room.finishedAt = Date.now();
   clearDisconnectTimer(room);
-
-  sendRoom(room, "gameFinished", { result, reason, onChainStatus: room.onChainReady ? "pending" : "waiting_for_match" });
-  void trySubmitResult(room);
+  sendRoom(room, "gameFinished", { roomId: room.id, result, reason });
+  void persistFinishedGame(room);
 }
 
-function scheduleResultRetry(room) {
-  if (room.retryTimer || room.resultSubmitted) return;
-  room.retryTimer = setTimeout(() => { room.retryTimer = null; void trySubmitResult(room); }, RESULT_RETRY_MS);
+function schedulePersistenceRetry(room) {
+  if (room.retryTimer || room.resultSaved) return;
+  room.retryTimer = setTimeout(() => { room.retryTimer = null; void persistFinishedGame(room); }, RESULT_RETRY_MS);
 }
 
-async function trySubmitResult(room) {
-  if (!room.finished || room.resultSubmitted) return;
-  if (!room.onChainReady || room.onChainMatchId == null) return;
-  if (room.submittingResult) return;
-
-  room.submittingResult = true;
+async function persistFinishedGame(room) {
+  if (!room.finished || room.resultSaved || room.savingResult) return;
+  room.savingResult = true;
   try {
-    const receipt = await submitOnChainResult(room.onChainMatchId, room.pendingResult);
-    room.resultSubmitted = true;
-    console.log(`[Chain] ${room.id}: result ${room.pendingResult} confirmed`, receipt.txHash || "");
-    sendRoom(room, "onChainResultSaved", { roomId: room.id, matchId: room.onChainMatchId, result: room.pendingResult, txHash: receipt.txHash || null });
-    
-    clearDisconnectTimer(room);
+    const whiteId = room.whitePlayerId;
+    const blackId = room.blackPlayerId;
+    if (!whiteId || !blackId) throw new Error("Both player identities are required to persist a PvP match");
+    const durationSeconds = Math.max(0, Math.floor(((room.finishedAt || Date.now()) - room.startedAt) / 1000));
+    const rpcBody = {
+      p_room_id: room.id,
+      p_white_player_id: String(whiteId),
+      p_black_player_id: String(blackId),
+      p_result: room.pendingResult,
+      p_pgn: room.game.pgn(),
+      p_time_control: room.timeControl,
+      p_moves: room.moveHistory,
+      p_finish_reason: room.finishReason || "completed",
+      p_started_at: new Date(room.startedAt).toISOString(),
+      p_duration_seconds: durationSeconds
+    };
+    const result = await supabaseRequest("rpc/finalize_chess_match", { method: "POST", body: JSON.stringify(rpcBody) });
+    room.resultSaved = true;
     if (room.retryTimer) clearTimeout(room.retryTimer);
+    sendRoom(room, "matchSaved", { roomId: room.id, alreadySaved: result === false });
     activeGames.delete(room.id);
   } catch (error) {
-    console.error(`[Chain] Result submission failed for ${room.id}:`, error.message);
-    sendRoom(room, "onChainResultPending", { roomId: room.id, matchId: room.onChainMatchId, result: room.pendingResult });
-    scheduleResultRetry(room);
-  } finally {
-    room.submittingResult = false;
-  }
+    console.error("[ChessGram] Match persistence failed:", room.id, error.message);
+    sendRoom(room, "matchSavePending", { roomId: room.id });
+    schedulePersistenceRetry(room);
+  } finally { room.savingResult = false; }
 }
 
-function startOnChainCreation(room) {
-  void (async () => {
-    try {
-      const data = await createOnChainMatch(room.white, room.black, room.timeControl);
-      room.onChainMatchId = String(data.matchId);
-      room.onChainReady = true;
-      console.log(`[Chain] ${room.id} -> match ${room.onChainMatchId}`);
-
-      // Отправляем matchId клиентам
-      sendRoom(room, "onChainMatchCreated", { matchId: room.onChainMatchId });
-
-      if (room.finished) {
-        await trySubmitResult(room);
-      }
-    } catch (error) {
-      room.onChainCreationFailed = true;
-      console.error(`[Chain] Could not create match for ${room.id}:`, error.message);
-      sendRoom(room, "onChainCreationFailed", { roomId: room.id, message: "Could not confirm on-chain match creation" });
-    }
-  })();
-}
-function createRoom(white, black, timeControl) {
-  const roomId = `room_${++roomCounter}`;
+function createRoom(white, black, timeControl, isPrivate = false) {
+  const roomId = "cg_" + crypto.randomBytes(9).toString("hex");
   const initialTimeMs = timeControl * 1000;
   const room = {
     id: roomId, game: new Chess(),
-    white: white.userAddress, black: black.userAddress,
+    whitePlayerId: white.telegramId, blackPlayerId: black.telegramId || null,
+    white: white.telegramId, black: black.telegramId || null,
+    whiteName: white.tgName || "Player", blackName: black.tgName || "Player",
+    whitePhoto: white.tgPhoto || null, blackPhoto: black.tgPhoto || null,
     whiteSocket: white.socketId, blackSocket: black.socketId,
     whiteResumeToken: crypto.randomBytes(32).toString("hex"),
     blackResumeToken: crypto.randomBytes(32).toString("hex"),
-    timeControl,
+    timeControl, isPrivate, startedAt: Date.now(),
     clocks: { white: initialTimeMs, black: initialTimeMs, lastMoveTimestamp: Date.now() },
-    moveHistory: [],
-    onChainMatchId: null, onChainReady: false, onChainCreationFailed: false,
-    pendingResult: null, resultSubmitted: false, submittingResult: false,
-    finished: false, finishReason: null, disconnectTimer: null, retryTimer: null
+    moveHistory: [], finished: false, resultSaved: false, savingResult: false,
+    pendingResult: null, finishReason: null, disconnectTimer: null, retryTimer: null
   };
   activeGames.set(roomId, room);
   return room;
 }
 
+function publicProfile(payload, auth) {
+  const tgName = typeof payload.tgName === "string" ? payload.tgName.trim().slice(0, 80) : "";
+  const tgPhoto = typeof payload.tgPhoto === "string" && /^https:\/\//i.test(payload.tgPhoto) ? payload.tgPhoto.slice(0, 2048) : auth.photoUrl || null;
+  return { telegramId: auth.sub, socketId: null, tgName: tgName || [auth.firstName, auth.lastName].filter(Boolean).join(" ") || (auth.username ? "@" + auth.username : "Player"), tgPhoto };
+}
+
 io.on("connection", (socket) => {
+  const auth = socket.data.player;
   socket.on("findMatch", (payload = {}) => {
-    const { userAddress } = payload;
-    const tgName = typeof payload.tgName === "string" ? payload.tgName.trim().slice(0, 80) : "";
-    const tgPhoto = typeof payload.tgPhoto === "string" && /^https:\/\//i.test(payload.tgPhoto)
-      ? payload.tgPhoto.slice(0, 2048)
-      : null;
-    // Log presence only; avoid storing full profile-photo URLs in production logs.
-    console.log("[findMatch] profile received:", {
-      socketId: socket.id,
-      tgName: tgName || "(missing)",
-      hasTgPhoto: Boolean(tgPhoto),
-      timeControl: payload.timeControl
-    });
     const timeControl = Number(payload.timeControl);
-    if (!/^0x[a-fA-F0-9]{40}$/.test(userAddress)) return socket.emit("moveError", { message: "Invalid address" });
-    if (!ALLOWED_TIME_CONTROLS.has(timeControl)) return socket.emit("moveError", { message: "Invalid timeControl" });
-
-    const normalized = userAddress.toLowerCase();
-    matchQueue = matchQueue.filter(p => p.socketId !== socket.id && p.userAddress.toLowerCase() !== normalized);
-
-    const opponentIndex = matchQueue.findIndex(p => p.timeControl === timeControl && p.userAddress.toLowerCase() !== normalized);
-    if (opponentIndex === -1) {
-      matchQueue.push({ socketId: socket.id, userAddress, timeControl, tgName, tgPhoto });
+    if (!ALLOWED_TIME_CONTROLS.has(timeControl)) return socket.emit("moveError", { message: "Invalid time control" });
+    const current = publicProfile(payload, auth);
+    current.socketId = socket.id;
+    matchQueue = matchQueue.filter(p => p.socketId !== socket.id && p.telegramId !== auth.sub);
+    const index = matchQueue.findIndex(p => p.timeControl === timeControl && p.telegramId !== auth.sub);
+    if (index === -1) {
+      matchQueue.push({ ...current, timeControl });
       socket.emit("waitingForOpponent");
       return;
     }
-
-    const opponent = matchQueue.splice(opponentIndex, 1)[0];
-    const current = { socketId: socket.id, userAddress, tgName, tgPhoto };
-    const firstIsWhite = Math.random() < 0.5;
-    const white = firstIsWhite ? opponent : current;
-    const black = firstIsWhite ? current : opponent;
+    const opponent = matchQueue.splice(index, 1)[0];
+    const firstWhite = Math.random() < 0.5;
+    const white = firstWhite ? opponent : current;
+    const black = firstWhite ? current : opponent;
     const room = createRoom(white, black, timeControl);
-    
     const whiteSocket = io.sockets.sockets.get(white.socketId);
     const blackSocket = io.sockets.sockets.get(black.socketId);
-    if (!whiteSocket || !blackSocket) { activeGames.delete(room.id); return socket.emit("moveError", { message: "Disconnected" }); }
-    
+    if (!whiteSocket || !blackSocket) { activeGames.delete(room.id); return socket.emit("moveError", { message: "Opponent disconnected" }); }
     whiteSocket.join(room.id); blackSocket.join(room.id);
-    
-    whiteSocket.emit("matchFound", {
-      roomId: room.id, color: "white", opponentAddress: room.black,
-      opponentName: black.tgName || "Anonymous", opponentPhoto: black.tgPhoto || null,
-      timeControl, resumeToken: room.whiteResumeToken
-    });
-    blackSocket.emit("matchFound", {
-      roomId: room.id, color: "black", opponentAddress: room.white,
-      opponentName: white.tgName || "Anonymous", opponentPhoto: white.tgPhoto || null,
-      timeControl, resumeToken: room.blackResumeToken
-    });
-    
+    whiteSocket.emit("matchFound", { roomId: room.id, color: "white", opponentTelegramId: black.telegramId, opponentName: black.tgName, opponentPhoto: black.tgPhoto, timeControl, resumeToken: room.whiteResumeToken });
+    blackSocket.emit("matchFound", { roomId: room.id, color: "black", opponentTelegramId: white.telegramId, opponentName: white.tgName, opponentPhoto: white.tgPhoto, timeControl, resumeToken: room.blackResumeToken });
     sendRoom(room, "gameState", { fen: room.game.fen(), clocks: room.clocks });
-    startOnChainCreation(room);
   });
 
+  socket.on("cancelFindMatch", () => {
+    matchQueue = matchQueue.filter(p => p.socketId !== socket.id);
+    socket.emit("matchSearchCancelled");
+  });
 
   socket.on("createPrivateRoom", (payload = {}) => {
-    const { userAddress } = payload;
     const timeControl = Number(payload.timeControl);
-    const tgName = typeof payload.tgName === "string" ? payload.tgName.trim().slice(0, 80) : "";
-    const tgPhoto = typeof payload.tgPhoto === "string" && /^https:\/\//i.test(payload.tgPhoto) ? payload.tgPhoto.slice(0, 2048) : null;
-    if (typeof userAddress !== "string" || !/^0x[a-fA-F0-9]{40}$/.test(userAddress)) return socket.emit("privateRoomError", { message: "Invalid address" });
-    if (!ALLOWED_TIME_CONTROLS.has(timeControl)) return socket.emit("privateRoomError", { message: "Invalid timeControl" });
+    if (!ALLOWED_TIME_CONTROLS.has(timeControl)) return socket.emit("privateRoomError", { message: "Invalid time control" });
     matchQueue = matchQueue.filter(p => p.socketId !== socket.id);
-    const placeholder = "0x0000000000000000000000000000000000000000";
-    const room = createRoom({ userAddress, socketId: socket.id, tgName, tgPhoto }, { userAddress: placeholder, socketId: null }, timeControl);
-    room.isPrivate = true;
-    room.whiteName = tgName;
-    room.whitePhoto = tgPhoto;
+    const creator = publicProfile(payload, auth);
+    creator.socketId = socket.id;
+    const room = createRoom(creator, { telegramId: null, socketId: null }, timeControl, true);
     socket.join(room.id);
     socket.emit("privateRoomCreated", { roomId: room.id, timeControl });
-    console.log(`[Private] Room ${room.id} created by ${userAddress}`);
   });
 
   socket.on("joinPrivateRoom", (payload = {}) => {
-    const { roomId, userAddress } = payload;
-    const room = typeof roomId === "string" ? activeGames.get(roomId) : null;
-    const tgName = typeof payload.tgName === "string" ? payload.tgName.trim().slice(0, 80) : "";
-    const tgPhoto = typeof payload.tgPhoto === "string" && /^https:\/\//i.test(payload.tgPhoto) ? payload.tgPhoto.slice(0, 2048) : null;
-    if (!room) return socket.emit("privateRoomError", { message: "Room not found or invite expired" });
-    if (!room.isPrivate) return socket.emit("privateRoomError", { message: "Not a private room" });
+    const room = typeof payload.roomId === "string" ? activeGames.get(payload.roomId) : null;
+    if (!room || !room.isPrivate) return socket.emit("privateRoomError", { message: "Invite not found or expired" });
     if (room.blackSocket !== null) return socket.emit("privateRoomError", { message: "Room is full" });
-    if (room.whiteSocket === socket.id || (typeof userAddress === "string" && userAddress.toLowerCase() === room.white.toLowerCase())) return socket.emit("privateRoomError", { message: "You cannot join your own invite" });
-    if (typeof userAddress !== "string" || !/^0x[a-fA-F0-9]{40}$/.test(userAddress)) return socket.emit("privateRoomError", { message: "Invalid address. Please log in first." });
+    if (room.whitePlayerId === auth.sub) return socket.emit("privateRoomError", { message: "You cannot join your own invite" });
     const whiteSocket = io.sockets.sockets.get(room.whiteSocket);
-    if (!whiteSocket) {
-      activeGames.delete(room.id);
-      return socket.emit("privateRoomError", { message: "Room creator disconnected. Ask them for a new invite." });
-    }
+    if (!whiteSocket) { activeGames.delete(room.id); return socket.emit("privateRoomError", { message: "Room creator disconnected" }); }
+    const guest = publicProfile(payload, auth);
     room.blackSocket = socket.id;
-    room.black = userAddress;
-    room.blackName = tgName;
-    room.blackPhoto = tgPhoto;
+    room.blackPlayerId = auth.sub;
+    room.black = auth.sub;
+    room.blackName = guest.tgName;
+    room.blackPhoto = guest.tgPhoto;
     socket.join(room.id);
-    whiteSocket.emit("matchFound", {
-      roomId: room.id, color: "white", opponentAddress: room.black,
-      opponentName: room.blackName || "Anonymous", opponentPhoto: room.blackPhoto || null,
-      timeControl: room.timeControl, resumeToken: room.whiteResumeToken
-    });
-    socket.emit("matchFound", {
-      roomId: room.id, color: "black", opponentAddress: room.white,
-      opponentName: room.whiteName || "Anonymous", opponentPhoto: room.whitePhoto || null,
-      timeControl: room.timeControl, resumeToken: room.blackResumeToken
-    });
+    whiteSocket.emit("matchFound", { roomId: room.id, color: "white", opponentTelegramId: auth.sub, opponentName: room.blackName, opponentPhoto: room.blackPhoto, timeControl: room.timeControl, resumeToken: room.whiteResumeToken });
+    socket.emit("matchFound", { roomId: room.id, color: "black", opponentTelegramId: room.whitePlayerId, opponentName: room.whiteName, opponentPhoto: room.whitePhoto, timeControl: room.timeControl, resumeToken: room.blackResumeToken });
     sendRoom(room, "gameState", { fen: room.game.fen(), clocks: room.clocks });
-    startOnChainCreation(room);
-    console.log(`[Private] Match started in ${room.id}`);
   });
 
   socket.on("resumeGame", (payload = {}) => {
-    const { roomId, resumeToken } = payload;
-    const room = activeGames.get(roomId);
-    if (!room || typeof resumeToken !== "string") return socket.emit("resumeFailed", { message: "Game cannot be resumed" });
-
+    const room = activeGames.get(payload.roomId);
+    if (!room || typeof payload.resumeToken !== "string") return socket.emit("resumeFailed", { message: "Game cannot be resumed" });
     let color = null;
-    if (resumeToken === room.whiteResumeToken) color = "white";
-    if (resumeToken === room.blackResumeToken) color = "black";
-    if (!color) return socket.emit("resumeFailed", { message: "Invalid token" });
-    if (room.finished) return socket.emit("resumeFailed", { message: "Game finished" });
-
+    if (payload.resumeToken === room.whiteResumeToken && room.whitePlayerId === auth.sub) color = "white";
+    if (payload.resumeToken === room.blackResumeToken && room.blackPlayerId === auth.sub) color = "black";
+    if (!color || room.finished) return socket.emit("resumeFailed", { message: "Invalid or expired resume token" });
     clearDisconnectTimer(room);
     if (color === "white") room.whiteSocket = socket.id; else room.blackSocket = socket.id;
     socket.join(room.id);
-    io.to(color === "white" ? room.blackSocket : room.whiteSocket).emit("opponentReconnected", { roomId: room.id });
-    socket.emit("gameResumed", { roomId: room.id, color, fen: room.game.fen(), clocks: room.clocks, moveHistory: room.moveHistory, onChainMatchId: room.onChainMatchId });
+    const opponentSocket = color === "white" ? room.blackSocket : room.whiteSocket;
+    if (opponentSocket) io.to(opponentSocket).emit("opponentReconnected", { roomId: room.id });
+    socket.emit("gameResumed", { roomId: room.id, color, fen: room.game.fen(), clocks: room.clocks, moveHistory: room.moveHistory });
   });
 
   socket.on("makeMove", (payload = {}) => {
-    const { roomId, from, to, promotion } = payload;
-    const room = activeGames.get(roomId);
+    const room = activeGames.get(payload.roomId);
     if (!room || room.finished || room.game.game_over()) return socket.emit("moveError", { message: "Game has finished or not found" });
-
     const currentTurn = room.game.turn();
     const expectedSocket = currentTurn === "w" ? room.whiteSocket : room.blackSocket;
     if (socket.id !== expectedSocket) return socket.emit("moveError", { message: "Not your turn" });
-
     try {
       const now = Date.now();
-      const timeSpent = now - room.clocks.lastMoveTimestamp;
-      const playerColor = currentTurn === "w" ? "white" : "black";
-
-      if (room.clocks[playerColor] - timeSpent <= 0) {
-        const winner = playerColor === "white" ? "black" : "white";
-        room.clocks[playerColor] = 0;
+      const spent = now - room.clocks.lastMoveTimestamp;
+      const color = currentTurn === "w" ? "white" : "black";
+      if (room.clocks[color] - spent <= 0) {
+        room.clocks[color] = 0;
+        const winner = color === "white" ? "black" : "white";
         sendRoom(room, "moveMade", { isGameOver: true, isCheckmate: false, isDraw: false, winner, reason: "timeout", clocks: room.clocks });
         finishGame(room, winner, "timeout");
         return;
       }
-
-      const move = room.game.move({ from, to, promotion: promotion || "q" });
+      const move = room.game.move({ from: payload.from, to: payload.to, promotion: payload.promotion || "q" });
       if (!move) return socket.emit("moveError", { message: "Illegal move" });
-      
-      room.clocks[playerColor] -= timeSpent;
+      room.clocks[color] -= spent;
       room.clocks.lastMoveTimestamp = now;
-      room.moveHistory.push({ san: move.san, from: move.from, to: move.to, timeSpentMs: timeSpent, timestamp: now, turn: currentTurn });
-
-      const isGameOver = room.game.game_over();
-      const isCheckmate = room.game.in_checkmate();
-      const isDraw = room.game.in_draw();
-      const winner = isCheckmate ? (room.game.turn() === "w" ? "black" : "white") : null;
-
-      sendRoom(room, "moveMade", { from: move.from, to: move.to, san: move.san, fen: room.game.fen(), turn: room.game.turn(), clocks: room.clocks, isGameOver, isCheckmate, isDraw, winner });
-
-      if (isGameOver) finishGame(room, isCheckmate ? winner : "draw", isCheckmate ? "checkmate" : "draw");
-    } catch (error) {
-      socket.emit("moveError", { message: error.message });
-    }
+      room.moveHistory.push({ san: move.san, from: move.from, to: move.to, timeSpentMs: spent, timestamp: now, turn: currentTurn });
+      const over = room.game.game_over();
+      const mate = room.game.in_checkmate();
+      const draw = room.game.in_draw();
+      const winner = mate ? (room.game.turn() === "w" ? "black" : "white") : null;
+      sendRoom(room, "moveMade", { from: move.from, to: move.to, san: move.san, fen: room.game.fen(), turn: room.game.turn(), clocks: room.clocks, isGameOver: over, isCheckmate: mate, isDraw: draw, winner });
+      if (over) finishGame(room, mate ? winner : "draw", mate ? "checkmate" : "draw");
+    } catch (error) { socket.emit("moveError", { message: error.message }); }
   });
 
   socket.on("disconnect", () => {
     matchQueue = matchQueue.filter(p => p.socketId !== socket.id);
     for (const room of activeGames.values()) {
       if (room.finished) continue;
-      const color = room.whiteSocket === socket.id ? "white" : (room.blackSocket === socket.id ? "black" : null);
+      const color = room.whiteSocket === socket.id ? "white" : room.blackSocket === socket.id ? "black" : null;
       if (!color) continue;
-
       clearDisconnectTimer(room);
       const opponentSocket = color === "white" ? room.blackSocket : room.whiteSocket;
-      io.to(opponentSocket).emit("opponentDisconnected", { roomId: room.id, message: "Opponent disconnected." });
-
-      const disconnectedSocketId = socket.id;
+      if (opponentSocket) io.to(opponentSocket).emit("opponentDisconnected", { roomId: room.id, message: "Opponent disconnected" });
       room.disconnectTimer = setTimeout(() => {
         room.disconnectTimer = null;
         const currentSocket = color === "white" ? room.whiteSocket : room.blackSocket;
-        if (activeGames.get(room.id) !== room || room.finished || currentSocket !== disconnectedSocketId) return;
+        if (activeGames.get(room.id) !== room || room.finished || currentSocket !== socket.id) return;
         const winner = color === "white" ? "black" : "white";
         sendRoom(room, "opponentForfeit", { winner, reason: "disconnect_timeout" });
         finishGame(room, winner, "disconnect_timeout");
@@ -338,6 +387,4 @@ io.on("connection", (socket) => {
 });
 
 const PORT = Number(process.env.PORT || 7860);
-server.listen(PORT, () => {
-  console.log(`[Chess server] Listening on port ${PORT}`);
-});
+server.listen(PORT, () => console.log("[ChessGram PvP] Listening on port " + PORT));
