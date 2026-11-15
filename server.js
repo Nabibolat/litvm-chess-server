@@ -250,10 +250,14 @@ function createRoom(white, black, timeControl, isPrivate = false) {
   return room;
 }
 
-function publicProfile(payload, auth) {
-  const tgName = typeof payload.tgName === "string" ? payload.tgName.trim().slice(0, 80) : "";
-  const tgPhoto = typeof payload.tgPhoto === "string" && /^https:\/\//i.test(payload.tgPhoto) ? payload.tgPhoto.slice(0, 2048) : auth.photoUrl || null;
-  return { telegramId: auth.sub, socketId: null, tgName: tgName || [auth.firstName, auth.lastName].filter(Boolean).join(" ") || (auth.username ? "@" + auth.username : "Player"), tgPhoto };
+function publicProfile(_payload, auth) {
+  const name = [auth.firstName, auth.lastName].filter(Boolean).join(" ").trim();
+  return {
+    telegramId: auth.sub,
+    socketId: null,
+    tgName: name || (auth.username ? "@" + auth.username : "Player"),
+    tgPhoto: typeof auth.photoUrl === "string" && /^https:\/\//i.test(auth.photoUrl) ? auth.photoUrl : null
+  };
 }
 
 io.on("connection", (socket) => {
@@ -369,6 +373,10 @@ io.on("connection", (socket) => {
     matchQueue = matchQueue.filter(p => p.socketId !== socket.id);
     for (const room of activeGames.values()) {
       if (room.finished) continue;
+      if (room.isPrivate && room.blackPlayerId === null && room.whiteSocket === socket.id) {
+        activeGames.delete(room.id);
+        continue;
+      }
       const color = room.whiteSocket === socket.id ? "white" : room.blackSocket === socket.id ? "black" : null;
       if (!color) continue;
       clearDisconnectTimer(room);
