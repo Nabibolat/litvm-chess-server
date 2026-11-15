@@ -167,9 +167,48 @@ app.get("/api/matches", async (req, res) => {
   if (!user) return res.status(401).json({ error: "Unauthorized" });
   try {
     const id = encodeURIComponent(user.sub);
-    const rows = await supabaseRequest("matches?select=id,room_id,white_player_id,black_player_id,result,pgn,time_control,created_at,finished_at,finish_reason,duration_seconds&or=(white_player_id.eq." + id + ",black_player_id.eq." + id + ")&order=created_at.desc&limit=50");
+    const rows = await supabaseRequest("matches?select=id,room_id,white_player_id,black_player_id,result,pgn,time_control,created_at,finished_at,finish_reason,duration_seconds,opponent_type,opponent_name&or=(white_player_id.eq." + id + ",black_player_id.eq." + id + ")&order=created_at.desc&limit=50");
     res.json({ matches: rows || [] });
   } catch (error) { res.status(503).json({ error: "Could not load match history" }); }
+});
+
+app.post("/api/bot-matches", async (req, res) => {
+  const user = bearerUser(req);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const body = req.body || {};
+  const playerColor = body.playerColor;
+  const result = body.result;
+  const timeControl = Number(body.timeControl);
+  const moves = Array.isArray(body.moves) ? body.moves.slice(0, 500) : [];
+  const pgn = typeof body.pgn === "string" ? body.pgn.slice(0, 200000) : "";
+  const opponentName = typeof body.opponentName === "string" ? body.opponentName.slice(0, 80) : "Stockfish";
+  const durationSeconds = Number(body.durationSeconds);
+  if (!["white", "black"].includes(playerColor) || !["white", "black", "draw"].includes(result) ||
+      !ALLOWED_TIME_CONTROLS.has(timeControl) || !Number.isFinite(durationSeconds) ||
+      durationSeconds < 0 || durationSeconds > 86400) {
+    return res.status(400).json({ error: "Invalid bot match data" });
+  }
+  try {
+    const roomId = "bot_" + crypto.randomUUID();
+    const saved = await supabaseRequest("rpc/finalize_chess_bot_match", {
+      method: "POST",
+      body: JSON.stringify({
+        p_room_id: roomId,
+        p_player_id: user.sub,
+        p_player_color: playerColor,
+        p_result: result,
+        p_pgn: pgn,
+        p_time_control: timeControl,
+        p_moves: moves,
+        p_opponent_name: opponentName,
+        p_duration_seconds: Math.floor(durationSeconds)
+      })
+    });
+    return res.json({ ok: true, saved: saved !== false, roomId });
+  } catch (error) {
+    console.error("[ChessGram] Bot match persistence failed:", error.message);
+    return res.status(503).json({ error: "Could not save bot match" });
+  }
 });
 
 app.get("/health", (_req, res) => res.json({ ok: true, service: "ChessGram PvP" }));
