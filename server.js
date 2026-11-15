@@ -93,7 +93,6 @@ async function supabaseRequest(path, options = {}) {
       signal: controller.signal,
       headers: {
         apikey: SUPABASE_SECRET_KEY,
-        Authorization: "Bearer " + SUPABASE_SECRET_KEY,
         "Content-Type": "application/json",
         ...(options.headers || {})
       }
